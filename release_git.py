@@ -45,7 +45,10 @@ def commit_usable_version(version: int, summary: str = "") -> bool:
         staged = subprocess.check_output(
             ["git", "diff", "--cached", "--name-only"],
             cwd=ROOT,
-            text=True,
+            # 中文 Windows 上 text=True 会按 GBK 解码，仓库里的中文文件名会直接
+            # 让读取线程抛 UnicodeDecodeError。
+            encoding="utf-8",
+            errors="replace",
         ).strip()
         if not staged:
             print("Nothing to commit.")
