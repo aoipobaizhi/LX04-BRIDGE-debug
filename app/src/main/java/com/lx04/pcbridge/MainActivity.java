@@ -21,6 +21,8 @@ public class MainActivity extends Activity {
     private int appliedSysRotation = Integer.MIN_VALUE;
     private boolean appliedLightTheme;
     private boolean allowLeave;
+    /** 只弹一次录音授权：拒绝后不再循环请求。 */
+    private boolean permissionAsked;
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Runnable tick = new Runnable() {
         @Override
@@ -223,22 +225,44 @@ public class MainActivity extends Activity {
 
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
-        if (requestCode == 11) {
-            ensurePermissionAndStart();
+        if (requestCode != 11) {
+            return;
         }
+        // 不能再无条件 ensurePermissionAndStart()：用户点"拒绝"（或"不再询问"时
+        // 系统立刻回调 denied）会形成"回调→再请求"的死循环，授权页反复抢屏。
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+            BridgeService.STATE.permissionDenied = false;
+        } else {
+            BridgeService.STATE.permissionDenied = true;
+            BridgeService.STATE.headline = "未授权麦克风";
+            BridgeService.STATE.detail = "电脑声音仍可播放；要麦克风请到系统设置里授权";
+        }
+        BridgeService.STATE.flushStatus = true;
+        startBridgeService();
     }
 
     private void ensurePermissionAndStart() {
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             BridgeService.STATE.permissionDenied = true;
             BridgeService.STATE.headline = "需要麦克风权限";
-            BridgeService.STATE.detail = "请授权录音后继续";
-            requestPermissions(new String[] {Manifest.permission.RECORD_AUDIO}, 11);
+            BridgeService.STATE.detail = "请授权录音；拒绝也不影响电脑声音播放";
+            if (!permissionAsked) {
+                permissionAsked = true;
+                requestPermissions(new String[] {Manifest.permission.RECORD_AUDIO}, 11);
+            }
+            // 无论授权与否都启动服务：播放与 HUD 不依赖录音权限。
+            startBridgeService();
             return;
         }
         BridgeService.STATE.permissionDenied = false;
-        Intent service = new Intent(this, BridgeService.class);
-        startForegroundService(service);
+        startBridgeService();
+    }
+
+    private void startBridgeService() {
+        try {
+            startForegroundService(new Intent(this, BridgeService.class));
+        } catch (Exception ignored) {
+        }
     }
 
     private void applyDisplayRotation(boolean upsideDown) {

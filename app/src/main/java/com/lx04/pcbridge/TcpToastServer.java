@@ -25,6 +25,9 @@ final class TcpToastServer {
     private Thread acceptThread;
     private volatile Socket client;
     private volatile OutputStream out;
+    private final java.util.concurrent.ArrayBlockingQueue<byte[]> outbound =
+            new java.util.concurrent.ArrayBlockingQueue<>(8);
+    private Thread writerThread;
 
     TcpToastServer(Callback callback) {
         this.callback = callback;
@@ -37,6 +40,9 @@ final class TcpToastServer {
         running = true;
         acceptThread = new Thread(this::acceptLoop, "lx04-toast");
         acceptThread.start();
+        writerThread = new Thread(this::writeLoop, "lx04-toast-out");
+        writerThread.setDaemon(true);
+        writerThread.start();
     }
 
     synchronized void stop() {
@@ -46,6 +52,11 @@ final class TcpToastServer {
         synchronized (outLock) {
             out = null;
         }
+        if (writerThread != null) {
+            writerThread.interrupt();
+            writerThread = null;
+        }
+        outbound.clear();
         if (server != null) {
             try {
                 server.close();
@@ -69,33 +80,68 @@ final class TcpToastServer {
         byte[] payload = json.toString().getBytes(StandardCharsets.UTF_8);
         byte[] frame = Protocol.encode(Protocol.EVENT, (byte) 0, seq.incrementAndGet(),
                 SystemClock.elapsedRealtime(), payload);
-        try {
-            synchronized (outLock) {
-                OutputStream stream = out;
-                if (stream == null) {
-                    return false;
-                }
-                stream.write(frame);
-                stream.flush();
-            }
-            return true;
-        } catch (Exception ignored) {
+        if (out == null) {
             return false;
+        }
+        // 只入队，交给专用写线程发送。
+        // 以前是在调用线程里直接 write+flush：音箱上点弹窗按钮走的是 UI 线程，
+        // PC 侧一旦不读 17892，写阻塞就会变成 ANR。
+        if (!outbound.offer(frame)) {
+            outbound.poll();
+            outbound.offer(frame);
+        }
+        return true;
+    }
+
+    private void writeLoop() {
+        while (running) {
+            byte[] frame;
+            try {
+                frame = outbound.poll(200, java.util.concurrent.TimeUnit.MILLISECONDS);
+            } catch (InterruptedException exc) {
+                break;
+            }
+            if (frame == null) {
+                continue;
+            }
+            try {
+                synchronized (outLock) {
+                    OutputStream stream = out;
+                    if (stream == null) {
+                        continue;
+                    }
+                    stream.write(frame);
+                    stream.flush();
+                }
+            } catch (Exception ignored) {
+                // 写失败保持静默：上层随时可以用 17890 回退通道。
+            }
         }
     }
 
     private void acceptLoop() {
         try {
-            server = new ServerSocket(Protocol.TOAST_PORT, 1, InetAddress.getByName("0.0.0.0"));
-            server.setReuseAddress(true);
+            // SO_REUSEADDR 必须在 bind 之前设置，构造带端口的 ServerSocket 已经绑过了。
+            ServerSocket bound = new ServerSocket();
+            bound.setReuseAddress(true);
+            bound.bind(new java.net.InetSocketAddress(InetAddress.getByName("0.0.0.0"), Protocol.TOAST_PORT), 1);
+            server = bound;
+            if (!running) {
+                closeQuietly(bound);
+                return;
+            }
             while (running) {
                 Socket socket;
                 try {
-                    socket = server.accept();
+                    socket = bound.accept();
                 } catch (Exception e) {
                     if (!running) {
                         break;
                     }
+                    continue;
+                }
+                if (!WifiPairServer.INSTANCE.acceptPeer(socket)) {
+                    closeQuietly(socket);
                     continue;
                 }
                 closeQuietly(client);
@@ -109,6 +155,9 @@ final class TcpToastServer {
                 }
             }
         } catch (Exception ignored) {
+        } finally {
+            // 绑定失败时复位，否则 running 永远为 true，start() 再也不重试。
+            running = false;
         }
     }
 
@@ -182,6 +231,16 @@ final class TcpToastServer {
     }
 
     private static void closeQuietly(Socket socket) {
+        if (socket == null) {
+            return;
+        }
+        try {
+            socket.close();
+        } catch (Exception ignored) {
+        }
+    }
+
+    private static void closeQuietly(ServerSocket socket) {
         if (socket == null) {
             return;
         }

@@ -1,6 +1,7 @@
 """PySide6 QML shell: FluentWinUI3 style + HostApp bindings."""
 from __future__ import annotations
 
+import socket
 import threading
 from pathlib import Path
 
@@ -79,16 +80,26 @@ class QtLoop(QObject):
         timer = self._timers.pop(tid, None)
         if timer is not None:
             timer.stop()
+            timer.deleteLater()
 
     def _arm(self, tid: int, ms: int, fn) -> None:
         timer = QTimer(self)
         timer.setSingleShot(True)
-        timer.timeout.connect(lambda: self._fire(tid, fn))
+
+        def fire() -> None:
+            self._fire(tid, fn, timer)
+
+        timer.timeout.connect(fire)
         self._timers[tid] = timer
         timer.start(ms)
 
-    def _fire(self, tid: int, fn) -> None:
+    def _fire(self, tid: int, fn, timer=None) -> None:
         self._timers.pop(tid, None)
+        if timer is not None:
+            # 必须显式销毁：QTimer 以 QtLoop 为父对象，由 C++ 侧持有，
+            # 只从字典里 pop 掉的话每 80ms（心跳）/ 每帧（音频）都会泄漏一个。
+            timer.stop()
+            timer.deleteLater()
         fn()
 
     def withdraw(self) -> None:
@@ -566,6 +577,8 @@ class HostBridge(QObject):
     diskIndexChanged = Signal()
     monitorIndexChanged = Signal()
     qualityIndexChanged = Signal()
+    transportChanged = Signal()
+    wifiChanged = Signal()
     micEnabledChanged = Signal()
     spkEnabledChanged = Signal()
     setDefaultSpkChanged = Signal()
@@ -812,26 +825,53 @@ class HostBridge(QObject):
         return text != "正在扫描…" and not text.startswith("没有") and not text.startswith("未找到")
 
     def refresh_diag(self) -> None:
-        try:
-            import vb_cable
+        """诊断项的探测要走 COM（VB-CABLE / Hi-Fi Cable / Afterburner，实测约 0.6 秒），
+        放到后台线程，避免点「刷新设备」时界面停顿。"""
+        if getattr(self, "_diag_busy", False):
+            return
+        self._diag_busy = True
 
-            self._vb = bool(vb_cable.present())
-        except Exception:
-            self._vb = False
-        try:
-            import hifi_cable
+        def work() -> None:
+            import comtypes
 
-            self._hifi = bool(hifi_cable.present())
-        except Exception:
-            self._hifi = False
-        try:
-            import afterburner
+            comtypes.CoInitialize()
+            vb = hifi = after = False
+            try:
+                import vb_cable
 
-            self._after = bool(afterburner.present())
-        except Exception:
-            self._after = False
-        self._diag_scanned = True
-        self.diagChanged.emit()
+                vb = bool(vb_cable.present())
+            except Exception:
+                vb = False
+            try:
+                import hifi_cable
+
+                hifi = bool(hifi_cable.present())
+            except Exception:
+                hifi = False
+            try:
+                import afterburner
+
+                after = bool(afterburner.present())
+            except Exception:
+                after = False
+
+            def apply() -> None:
+                # 先写好属性再发信号：diagChanged 是跨线程排队投递，QML 侧的
+                # 属性读取会在 GUI 线程上、于本次写入之后发生。
+                self._vb, self._hifi, self._after = vb, hifi, after
+                self._diag_scanned = True
+                self._diag_busy = False
+                self.diagChanged.emit()
+
+            try:
+                apply()
+            finally:
+                try:
+                    comtypes.CoUninitialize()
+                except Exception:
+                    pass
+
+        threading.Thread(target=work, daemon=True, name="lx04-diag").start()
 
     def sync_screen(self) -> None:
         host = self.host
@@ -1057,6 +1097,55 @@ class HostBridge(QObject):
         if self.host:
             return 1 if int(self.host.sys_rotation.get() or 0) == 2 else 0
         return self._rotation_index
+
+    @Property(int, notify=transportChanged)
+    def transportIndex(self) -> int:
+        if not self.host:
+            return 0
+        mode = str(self.host.transport.get())
+        if mode == "wifiadb":
+            return 1
+        if mode == "wifi":
+            return 2
+        return 0
+
+    @Property(list, constant=True)
+    def transportLabels(self) -> list:
+        # Android 8.1 没有"无线调试配对"，所以 PC 侧用 adb tcpip + adb connect。
+        return ["USB 数据线", "WiFi · 无线 ADB（功能齐全）", "WiFi · 直连（无 adb，降级）"]
+
+    @Property(str, notify=wifiChanged)
+    def wifiIp(self) -> str:
+        return str(self.host.wifi_ip.get() or "") if self.host else ""
+
+    @Property(str, notify=wifiChanged)
+    def wifiCode(self) -> str:
+        return str(self.host.wifi_code.get() or "") if self.host else ""
+
+    @Property(str, notify=wifiChanged)
+    def wifiStatus(self) -> str:
+        return str(getattr(self.host, "_wifi_status", "") or "") if self.host else ""
+
+    @Property(bool, notify=wifiChanged)
+    def wifiPaired(self) -> bool:
+        return bool(str(self.host.wifi_token.get() or "").strip()) if self.host else False
+
+    @Property(bool, notify=wifiChanged)
+    def wifiBusy(self) -> bool:
+        if not self.host:
+            return False
+        return bool(getattr(self.host, "_wifi_scanning", False)
+                    or getattr(self.host, "_wifi_pairing", False))
+
+    @Property("QVariantList", notify=wifiChanged)
+    def wifiDevices(self) -> list:
+        if not self.host:
+            return []
+        items = []
+        for dev in getattr(self.host, "_wifi_devices", []) or []:
+            items.append({"ip": dev.ip, "label": dev.label(),
+                          "pairing": bool(dev.pairing)})
+        return items
 
     @Property(bool, notify=micEnabledChanged)
     def micEnabled(self) -> bool:
@@ -1416,6 +1505,163 @@ class HostBridge(QObject):
     @Slot(int)
     def setQualityIndex(self, index: int) -> None:
         self._set_combo_index("quality", index, self.host._on_quality_change)
+
+    @Slot(int)
+    def setTransportIndex(self, index: int) -> None:
+        if not self.host:
+            return
+        self.host.transport.set({1: "wifiadb", 2: "wifi"}.get(int(index), "usb"))
+        self.host._save_routes()
+        self.transportChanged.emit()
+        self.refresh_diag()
+
+    @Slot()
+    def enableWifiAdb(self) -> None:
+        """插着数据线时执行 adb tcpip 5555，之后就能拔线走无线 ADB。
+
+        这里每一条 adb 调用都可能耗到超时（十几秒），所以整体放在后台线程，
+        界面只负责更新状态文字。
+        """
+        if not self.host or not self.host.adb:
+            return
+        if getattr(self, "_wifi_adb_busy", False):
+            return
+        self._wifi_adb_busy = True
+        self.host._wifi_status = "正在激活无线 ADB…"
+        self.wifiChanged.emit()
+        threading.Thread(target=self._enable_wifi_adb_worker, daemon=True,
+                         name="lx04-tcpip").start()
+
+    def _enable_wifi_adb_worker(self) -> None:
+        import adb_usb  # 延迟导入：pc_host 反向依赖本模块，避免循环 import
+
+        host = self.host
+        try:
+            devices = [d for d in adb_usb.list_devices(host.adb) if ":" not in d]
+            if not devices:
+                host._wifi_status = "没有找到 USB 设备：先把数据线插上再点这个按钮"
+                return
+            serial = devices[0]
+            message = adb_usb.enable_tcpip(host.adb, serial)
+            if not str(host.wifi_ip.get() or "").strip():
+                ip = adb_usb.device_ip(host.adb, serial)
+                if ip:
+                    host.wifi_ip.set(ip)
+                    host._save_routes()
+            host._wifi_status = message + "：可以拔线，然后点「连接」"
+        except Exception as exc:
+            host._wifi_status = "激活无线 ADB 失败: " + str(exc)
+        finally:
+            self._wifi_adb_busy = False
+        self.wifiChanged.emit()
+
+    @Slot(str)
+    def setWifiIp(self, text: str) -> None:
+        if not self.host:
+            return
+        self.host.wifi_ip.set(str(text or "").strip())
+        self.host._save_routes()
+        self.wifiChanged.emit()
+
+    @Slot(str)
+    def setWifiCode(self, text: str) -> None:
+        if not self.host:
+            return
+        self.host.wifi_code.set(str(text or "").strip())
+        self.wifiChanged.emit()
+
+    @Slot()
+    def scanWifi(self) -> None:
+        if not self.host or getattr(self.host, "_wifi_scanning", False):
+            return
+        self.host._wifi_scanning = True
+        self.host._wifi_status = "正在扫描局域网…"
+        self.wifiChanged.emit()
+        threading.Thread(target=self._wifi_scan_worker, daemon=True, name="lx04-wifi-scan").start()
+
+    def _wifi_scan_worker(self) -> None:
+        host = self.host
+        try:
+            import wifi_pair
+
+            found = wifi_pair.discover(extra_ips=[str(host.wifi_ip.get() or "").strip()])
+            host._wifi_devices = found
+            if found:
+                host._wifi_status = f"发现 {len(found)} 台设备，选中后填配对码"
+                if not str(host.wifi_ip.get() or "").strip():
+                    host.wifi_ip.set(found[0].ip)
+                    host._save_routes()
+            else:
+                host._wifi_status = "没有发现设备：确认与音箱在同一局域网，并在音箱上开启 WiFi 配对模式"
+        except Exception as exc:
+            host._wifi_devices = []
+            host._wifi_status = "扫描失败: " + str(exc)
+        finally:
+            host._wifi_scanning = False
+        try:
+            self.wifiChanged.emit()
+        except Exception:
+            pass
+
+    @Slot(str)
+    def useWifiDevice(self, ip: str) -> None:
+        if not self.host:
+            return
+        self.host.wifi_ip.set(str(ip or "").strip())
+        self.host._wifi_status = "已选择 " + str(ip or "")
+        self.host._save_routes()
+        self.wifiChanged.emit()
+
+    @Slot()
+    def pairWifi(self) -> None:
+        if not self.host or getattr(self.host, "_wifi_pairing", False):
+            return
+        if not str(self.host.wifi_ip.get() or "").strip():
+            self.host._wifi_status = "请先扫描或填写音箱 IP"
+            self.wifiChanged.emit()
+            return
+        self.host._wifi_pairing = True
+        self.host._wifi_status = "正在配对…"
+        self.wifiChanged.emit()
+        threading.Thread(target=self._wifi_pair_worker, daemon=True, name="lx04-wifi-pair").start()
+
+    def _wifi_pair_worker(self) -> None:
+        host = self.host
+        try:
+            import wifi_pair
+
+            ip = str(host.wifi_ip.get() or "").strip()
+            code = str(host.wifi_code.get() or "").strip()
+            ok, token, message = wifi_pair.pair(ip, code, socket.gethostname())
+            if ok:
+                host.wifi_token.set(token)
+                host._wifi_status = "配对成功：以后直接连，不用再输配对码"
+                host._save_routes()
+            else:
+                host._wifi_status = message
+        except Exception as exc:
+            host._wifi_status = "配对失败: " + str(exc)
+        finally:
+            host._wifi_pairing = False
+        try:
+            self.wifiChanged.emit()
+        except Exception:
+            pass
+
+    @Slot()
+    def forgetWifi(self) -> None:
+        if not self.host:
+            return
+        # 让音箱也忘掉 token：否则它的局域网服务会一直对已配对主机开放。
+        try:
+            if self.host.connected:
+                self.host.client.send_control("wifi_forget")
+        except Exception:
+            pass
+        self.host.wifi_token.set("")
+        self.host._save_routes()
+        self.host._wifi_status = "已清除配对，需要重新输入音箱上的配对码"
+        self.wifiChanged.emit()
 
     @Slot(int)
     def setRotationIndex(self, index: int) -> None:

@@ -12,6 +12,8 @@ CREATE_NO_WINDOW = 0x08000000
 PORT = 17890
 VIDEO_PORT = 17891
 TOAST_PORT = 17892
+# 无线 ADB（adb tcpip / adb connect）用的端口，Android 8.1 原生支持。
+TCPIP_PORT = 5555
 PKG = "com.lx04.pcbridge"
 SERVICE = PKG + "/.BridgeService"
 
@@ -58,7 +60,11 @@ def _run(adb: str, args: list[str], timeout: float = 8.0) -> subprocess.Complete
     return subprocess.run(
         [adb, *args],
         capture_output=True,
-        text=True,
+        # 不能只写 text=True：那样会按系统 ANSI 代码页（中文 Windows 上是 GBK）
+        # 解码 adb 的输出，一旦出现非 GBK 字节，读取线程会抛 UnicodeDecodeError，
+        # stdout 变成空、returncode 也可能失真，于是所有 adb 结果都不可信。
+        encoding="utf-8",
+        errors="replace",
         timeout=timeout,
         creationflags=CREATE_NO_WINDOW if os.name == "nt" else 0,
         cwd=str(Path(adb).resolve().parent),
@@ -147,6 +153,66 @@ def release_speaker_mic(adb: str, serial: str | None = None) -> str:
     if last not in {"running", "restarting"}:
         return "小爱唤醒麦未恢复（mivpm=" + (last or text or "unknown") + "）"
     return "已恢复小爱唤醒麦"
+
+
+def enable_tcpip(adb: str, serial: str | None = None, port: int = TCPIP_PORT) -> str:
+    """让音箱上的 adbd 监听 TCP 端口，之后可以拔线走 WiFi。
+
+    Android 8.1 没有"无线调试配对"（那是 Android 11 才有的），但 `adb tcpip`
+    从很早就支持：它把 adbd 重启到 TCP 模式，仍然用现有的 adb 密钥鉴权。
+    需要设备此刻通过 USB 连着。
+    """
+    args = ["-s", serial] if serial else []
+    result = _run(adb, [*args, "tcpip", str(port)], timeout=15)
+    text = ((result.stdout or "") + "\n" + (result.stderr or "")).strip()
+    if result.returncode != 0 or "error" in text.lower():
+        raise RuntimeError(text or f"adb tcpip {port} 失败")
+    return text or f"adbd 已在 {port} 端口监听，可以拔线了"
+
+
+def connect_wifi(adb: str, host: str, port: int = TCPIP_PORT, timeout: float = 15.0) -> str:
+    """adb connect 到音箱的局域网地址；失败抛异常。"""
+    if not host:
+        raise RuntimeError("请先填写音箱的局域网 IP")
+    target = f"{host}:{port}"
+    result = _run(adb, ["connect", target], timeout=timeout)
+    text = ((result.stdout or "") + "\n" + (result.stderr or "")).strip()
+    low = text.lower()
+    bad = ("cannot connect" in low or "unable to connect" in low
+           or "failed to connect" in low or "refused" in low)
+    if result.returncode != 0 or bad:
+        raise RuntimeError(text or f"连不上 {target}；请在音箱上先用数据线执行过一次 adb tcpip")
+    return text or f"已连接 {target}"
+
+
+def disconnect_wifi(adb: str, host: str, port: int = TCPIP_PORT) -> None:
+    if not adb or not host:
+        return
+    _run(adb, ["disconnect", f"{host}:{port}"], timeout=6)
+
+
+def wifi_serial(host: str, port: int = TCPIP_PORT) -> str:
+    """走 WiFi 时 adb 的 -s 参数值。"""
+    return f"{host}:{port}"
+
+
+def device_ip(adb: str, serial: str | None = None) -> str:
+    """读音箱的局域网 IPv4，用来替用户填好 IP（优先 wlan0）。"""
+    args = ["-s", serial] if serial else []
+    for script in ("ip -f inet addr show wlan0", "ip route", "getprop dhcp.wlan0.ipaddress"):
+        try:
+            result = _run(adb, [*args, "shell", script], timeout=8)
+        except Exception:
+            continue
+        text = (result.stdout or "") + "\n" + (result.stderr or "")
+        for token in text.replace("/", " ").replace(":", " ").split():
+            parts = token.split(".")
+            if len(parts) != 4:
+                continue
+            if all(part.isdigit() and 0 <= int(part) < 256 for part in parts):
+                if not token.startswith("127.") and not token.startswith("0."):
+                    return token
+    return ""
 
 
 def usb_forward(adb: str, serial: str | None = None) -> None:

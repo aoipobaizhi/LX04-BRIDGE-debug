@@ -10,6 +10,8 @@ final class Protocol {
     static final int PORT = 17890;
     static final int VIDEO_PORT = 17891;
     static final int TOAST_PORT = 17892;
+    /** WiFi（局域网）配对用的 UDP 端口，见 WifiPairServer。 */
+    static final int WIFI_PAIR_PORT = 17893;
     static final int MAX_PAYLOAD = 256 * 1024;
 
     static final byte HELLO = 0x01;
@@ -64,6 +66,89 @@ final class Protocol {
             return null;
         }
         return frame;
+    }
+
+    /** 从流里读一帧（帧头 + payload）。流结束返回 null，帧头非法抛 IOException。 */
+    static Frame readFrame(java.io.InputStream in) throws java.io.IOException {
+        byte[] header = new byte[HEADER_SIZE];
+        if (!readFully(in, header)) {
+            return null;
+        }
+        Frame frame = decodeHeader(header);
+        if (frame == null) {
+            throw new java.io.IOException("bad frame header");
+        }
+        byte[] payload = new byte[frame.payloadLength];
+        if (frame.payloadLength > 0 && !readFully(in, payload)) {
+            throw new java.io.IOException("short payload");
+        }
+        frame.payload = payload;
+        return frame;
+    }
+
+    static boolean readFully(java.io.InputStream in, byte[] dest) throws java.io.IOException {
+        int off = 0;
+        while (off < dest.length) {
+            int n = in.read(dest, off, dest.length - off);
+            if (n < 0) {
+                return false;
+            }
+            off += n;
+        }
+        return true;
+    }
+
+    /**
+     * 增量帧读取器。
+     *
+     * <p>比一次性 {@link #readFrame} 多保留"已读进度"：socket 读超时
+     * （SO_TIMEOUT → SocketTimeoutException）打断在帧头或负载中间时，已读字节
+     * 不会丢，下次调用从断点继续。否则超时后重读会从错位处解析，魔数校验失败
+     * 直接断链。
+     */
+    static final class Reader {
+        private final java.io.InputStream in;
+        private final byte[] header = new byte[HEADER_SIZE];
+        private int headerOff;
+        private byte[] payload = new byte[0];
+        private int payloadOff;
+        private Frame frame;
+
+        Reader(java.io.InputStream in) {
+            this.in = in;
+        }
+
+        /** 读下一帧；流结束返回 null；超时抛 SocketTimeoutException 并保留进度。 */
+        Frame next() throws java.io.IOException {
+            if (frame == null) {
+                while (headerOff < HEADER_SIZE) {
+                    int n = in.read(header, headerOff, HEADER_SIZE - headerOff);
+                    if (n < 0) {
+                        return null;
+                    }
+                    headerOff += n;
+                }
+                frame = decodeHeader(header);
+                if (frame == null) {
+                    throw new java.io.IOException("bad frame header");
+                }
+                payload = new byte[frame.payloadLength];
+                payloadOff = 0;
+            }
+            while (payloadOff < payload.length) {
+                int n = in.read(payload, payloadOff, payload.length - payloadOff);
+                if (n < 0) {
+                    return null;
+                }
+                payloadOff += n;
+            }
+            Frame done = frame;
+            done.payload = payload;
+            frame = null;
+            headerOff = 0;
+            payloadOff = 0;
+            return done;
+        }
     }
 
     static final class Frame {

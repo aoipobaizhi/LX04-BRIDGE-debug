@@ -1,6 +1,13 @@
-# LX04 PC Bridge 协议（USB 数据线）
+# LX04 PC Bridge 协议（USB 数据线 / WiFi 局域网）
 
 二进制小端帧，走 TCP。默认端口 **17890**。
+
+## 两种传输方式
+
+| 方式 | 怎么连 | 说明 |
+|------|--------|------|
+| USB 数据线 | `adb forward tcp:17890 tcp:17890`（17891/17892 同理），再连 `127.0.0.1` | 默认方式，功能最全（可直采硬件麦、小爱让位、写系统旋转） |
+| WiFi 局域网 | 直接连音箱的局域网 IP 同一组端口，先做一次配对 | 不用数据线；需要先配对，见下节 |
 
 电脑用 USB 连音箱后，上位机执行：
 
@@ -11,6 +18,36 @@ adb forward tcp:17892 tcp:17892
 ```
 
 然后连接 `127.0.0.1:17890`（音频、音量、状态、控制）、`127.0.0.1:17891`（屏幕镜像）和 `127.0.0.1:17892`（系统弹窗）。三条隧道都走 USB 上的 ADB，不依赖 Wi-Fi。镜像和弹窗都不占用音频通道。
+
+## WiFi（局域网）配对
+
+服务端在 **UDP 17893** 上应答发现与配对请求（音箱端 `WifiPairServer`），报文一律是
+UTF-8 JSON 且带 `"magic": "LXB1"`：
+
+| 方向 | 报文 | 说明 |
+|------|------|------|
+| 电脑→音箱（广播/单播） | `{"cmd":"discover","magic":"LXB1","nonce":"…"}` | 探测同网段的 LX04 |
+| 音箱→电脑 | `{"cmd":"offer","device":"LX04","model":…,"ip":…,"port":17890,"videoPort":17891,"toastPort":17892,"pairing":true,"paired":false,"nonce":"…"}` | 设备信息，**不含配对码** |
+| 电脑→音箱 | `{"cmd":"pair","code":"123456","name":"PC-NAME","nonce":"…"}` | 提交音箱屏幕上显示的 6 位配对码 |
+| 音箱→电脑 | `{"cmd":"pair_ok","token":"<32 位十六进制>","ip":…}` | 配对成功，保存 token 以后免配对码 |
+| 音箱→电脑 | `{"cmd":"pair_deny","reason":"bad_code\|cooldown\|off","left":3}` | 失败；连错 5 次冷却 30 秒 |
+
+配对码只在音箱屏幕上显示、由人工输入电脑，不随广播外发。配对成功后，电脑把 token
+保存在本地（`host/audio_routes.json` 的 `wifi_token`）。
+
+局域网客户端连上 17890 后必须**先发一帧鉴权 CONTROL**，否则 6 秒内被断开：
+
+```json
+{"cmd": "wifi_auth", "token": "…", "name": "PC-NAME"}
+{"cmd": "wifi_auth", "code": "123456", "name": "PC-NAME"}
+```
+
+音箱回一帧 EVENT `{"cmd":"wifi_auth","ok":true,"token":"…"}`（用配对码鉴权时会带回新
+token）。回环地址（USB / adb forward）的客户端视为本机，永远放行、无需鉴权。17891 /
+17892 只接受已授权或已配对主机的连接。
+
+USB 模式下不需要配对；`WifiPairServer` 在音箱菜单里「WiFi 配对 → 配对模式」打开后才
+接受局域网的新配对，已完成过一次配对的音箱（有 token）仍允许老主机直接连入。
 
 ## 帧头 16 字节
 
@@ -77,6 +114,13 @@ adb forward tcp:17892 tcp:17892
   "uiHidden": false,
   "screenMirror": false,
   "toastOverlay": false,
+  "clientIsLan": false,
+  "wifiOn": false,
+  "wifiPairing": false,
+  "wifiPaired": false,
+  "wifiIp": "192.168.1.23",
+  "wifiPort": 17893,
+  "wifiPairCode": "",
   "hudBg": {"sel": 0, "used": [true, false, false], "alpha": 85},
   "hudStyle": {
     "rev": 1710000000000,
@@ -100,6 +144,9 @@ adb forward tcp:17892 tcp:17892
 {"cmd": "hud_style", "reset": true, "rev": 1710000000001}
 {"cmd": "ping"}
 {"cmd": "volume", "level": 0.55}
+{"cmd": "wifi_auth", "token": "…", "name": "PC-NAME"}
+{"cmd": "wifi_pair", "on": true}
+{"cmd": "wifi_forget"}
 {"cmd": "pc_stats", "cpu": 34, "cpuT": 59, "gpu": 12, "gpuT": 49, "gpuN": "RTX 4070 SUPER", "vram": 28, "gpuW": 32, "ram": 35, "ramU": 22.2, "ramT": 63.8, "disk": 42, "diskN": "D:", "diskU": 400, "diskT": 931, "netD": 1500, "netU": 120, "up": 3600, "cores": 24, "now": 1710000000000, "tz": 480}
 {"cmd": "mirror_info", "title": "1  1920×1080  主屏"}
 {"cmd": "toast_overlay", "on": true, "app": "Cursor", "title": "申请权限", "body": "想要使用麦克风", "buttons": [{"id": "0", "label": "拒绝"}, {"id": "1", "label": "允许"}]}

@@ -51,16 +51,27 @@ final class TcpVideoServer {
 
     private void acceptLoop() {
         try {
-            server = new ServerSocket(Protocol.VIDEO_PORT, 1, InetAddress.getByName("0.0.0.0"));
-            server.setReuseAddress(true);
+            // SO_REUSEADDR 必须在 bind 之前设置，构造带端口的 ServerSocket 已经绑过了。
+            ServerSocket bound = new ServerSocket();
+            bound.setReuseAddress(true);
+            bound.bind(new java.net.InetSocketAddress(InetAddress.getByName("0.0.0.0"), Protocol.VIDEO_PORT), 1);
+            server = bound;
+            if (!running) {
+                closeQuietly(bound);
+                return;
+            }
             while (running) {
                 Socket socket;
                 try {
-                    socket = server.accept();
+                    socket = bound.accept();
                 } catch (Exception e) {
                     if (!running) {
                         break;
                     }
+                    continue;
+                }
+                if (!WifiPairServer.INSTANCE.acceptPeer(socket)) {
+                    closeQuietly(socket);
                     continue;
                 }
                 closeQuietly(client);
@@ -71,6 +82,9 @@ final class TcpVideoServer {
                 }
             }
         } catch (Exception ignored) {
+        } finally {
+            // 绑定失败时复位，否则 running 永远为 true，start() 再也不重试。
+            running = false;
         }
     }
 
@@ -128,6 +142,16 @@ final class TcpVideoServer {
     }
 
     private static void closeQuietly(Socket socket) {
+        if (socket == null) {
+            return;
+        }
+        try {
+            socket.close();
+        } catch (Exception ignored) {
+        }
+    }
+
+    private static void closeQuietly(ServerSocket socket) {
         if (socket == null) {
             return;
         }

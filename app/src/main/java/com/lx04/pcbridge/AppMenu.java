@@ -40,6 +40,7 @@ final class AppMenu {
     private final RectF clockSecondRect = new RectF();
     private final RectF bootRect = new RectF();
     private final RectF hudRect = new RectF();
+    private final RectF wifiRect = new RectF();
     private final RectF settingsPanel = new RectF();
     private final RectF settingsViewport = new RectF();
     private final RectF bgRow = new RectF();
@@ -297,6 +298,10 @@ final class AppMenu {
         y = drawSwitchRow(canvas, draw, "后台运行", y, hudRect, s.uiHidden);
         y = drawSettingHint(canvas, draw, "后台后屏幕还给小爱，音频仍在跑。点图标可再打开。", y);
 
+        y = drawSettingLabel(canvas, draw, "WiFi 配对", y);
+        y = drawSwitchRow(canvas, draw, "配对模式", y, wifiRect, BridgeService.isWifiPairing());
+        y = drawSettingHint(canvas, draw, wifiHint(), y);
+
         bgRow.set(left, y + dp(8), right, y + dp(54));
         if (draw) {
             card.setColor(colCard());
@@ -310,6 +315,18 @@ final class AppMenu {
             drawChevron(canvas, bgRow.right - dp(18), bgRow.centerY(), dp(8), colDim(), false);
         }
         return bgRow.bottom + dp(16) - start;
+    }
+
+    /** WiFi 配对那一行下面的说明：直接显示电脑要填的 IP 和配对码。 */
+    private String wifiHint() {
+        String ip = BridgeService.wifiIp();
+        if (BridgeService.isWifiPairing()) {
+            return (ip.isEmpty() ? "音箱未连上局域网" : ip) + " · 配对码 " + BridgeService.wifiPairCode();
+        }
+        if (BridgeService.STATE.wifiPaired) {
+            return (ip.isEmpty() ? "已配对过" : ip) + " · 已配对，上位机可直接连接";
+        }
+        return "开启后用上位机的 WiFi 模式扫描，或在电脑上手动填 IP 与配对码。";
     }
 
     private float drawSettingLabel(Canvas canvas, boolean draw, String title, float y) {
@@ -694,6 +711,11 @@ final class AppMenu {
             }
             if (hitSetting(hudRect, x, y)) {
                 BridgeService.setUiHidden(view.getContext(), !BridgeService.STATE.uiHidden);
+                return true;
+            }
+            if (hitSetting(wifiRect, x, y)) {
+                BridgeService.setWifiPairing(view.getContext(), !BridgeService.isWifiPairing());
+                view.invalidate();
                 return true;
             }
             if (hitSetting(bgRow, x, y)) {

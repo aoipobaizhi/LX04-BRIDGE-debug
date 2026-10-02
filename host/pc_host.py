@@ -42,6 +42,7 @@ import vb_cable
 import win_endpoint
 import win_mic
 import win_volume
+import wifi_pair
 from audio_out import AudioSink, find_hidden_cable_ks_output
 from hw_capture import HardwareMic
 from speaker_loopback import SpeakerLoopback
@@ -640,6 +641,14 @@ class HostApp:
         self.inject_var = Var("")
         self.spk_dev_var = Var("")
         self.device_var = Var("正在扫描…")
+        self.transport = Var("usb")
+        self.wifi_ip = Var("")
+        self.wifi_code = Var("")
+        self.wifi_token = Var("")
+        self._wifi_devices: list[wifi_pair.Device] = []
+        self._wifi_pairing_seen = False
+        self._wifi_auth_wait: threading.Event | None = None
+        self._wifi_auth_result: dict = {}
         self.mic_var = Var("尚未识别")
         self.gain_var = Var(100)
         self.gain_label_var = Var("100%  ·  0.0 dB")
@@ -661,6 +670,8 @@ class HostApp:
         self._stats_ticks = 0
         self._stats_logged = False
         self._stats_busy = False
+        self._refreshing = False
+        self._connecting = False
         self._last_stats: dict = {}
         self._hud_need_reconcile = False
         self._hud_from_apk = False
@@ -690,13 +701,8 @@ class HostApp:
         self._log("adb: " + (self.adb or "未找到内置 adb"))
         if not self.sink.available():
             self._log("音频库未安装：在 host 目录执行  pip install -r requirements.txt")
-        try:
-            self.refresh_audio_devices(log=True, tidy=False)
-            self._refresh_disks()
-            self._refresh_monitors()
-            self._routes_ready = True
-        except Exception as exc:
-            self._log("启动扫描: " + str(exc))
+        # 列表由后台线程填充（见 refresh_devices），先把界面交还给用户。
+        self._routes_ready = True
         self._boot()
 
     def _ui(self, fn) -> None:
@@ -770,6 +776,11 @@ class HostApp:
         self.toast_mirror.set(bool(data.get("toast_mirror", False)))
         self.xiaoai_yield.set(bool(data.get("xiaoai_yield", False)))
         self.minimize_to_tray.set(bool(data.get("minimize_to_tray", False)))
+        self.transport.set(str(data.get("transport") or "usb")
+                           if str(data.get("transport") or "usb") in ("usb", "wifiadb", "wifi")
+                           else "usb")
+        self.wifi_ip.set(str(data.get("wifi_ip") or ""))
+        self.wifi_token.set(str(data.get("wifi_token") or ""))
         self._saved_inject = str(data.get("inject") or "")
         self._saved_spk = str(data.get("speaker") or "")
         self._saved_disk = str(data.get("pc_disk") or "")
@@ -785,54 +796,10 @@ class HostApp:
                 pass
 
     def _boot(self) -> None:
-        threading.Thread(target=self._boot_scan, daemon=True, name="lx04-boot").start()
-
-    def _boot_scan(self) -> None:
-        import comtypes
-
-        comtypes.CoInitialize()
-        hidden: list[str] = []
-        devices: list[str] = []
-        err = ""
-        try:
-            try:
-                hidden = win_endpoint.tidy_cable_endpoints()
-            except Exception as exc:
-                err = str(exc)
-            if self.adb:
-                try:
-                    devices = adb_usb.list_devices(self.adb)
-                except Exception as exc:
-                    err = (err + " " + str(exc)).strip()
-        finally:
-            try:
-                comtypes.CoUninitialize()
-            except Exception:
-                pass
-        try:
-            self.root.after(0, lambda: self._boot_apply(hidden, devices, err))
-        except Exception:
-            pass
-
-    def _boot_apply(self, hidden: list[str], devices: list[str], err: str) -> None:
-        if self._closing:
-            return
-        if hidden:
-            self._log("已从系统播放列表隐藏：" + "、".join(hidden))
-        if err:
-            self._log("启动扫描: " + err)
-        self.devices = devices
-        if not self.adb:
-            labels = ["未找到 adb"]
-        else:
-            labels = devices or ["没有 USB 设备（检查数据线 / USB 调试）"]
-        self.device_drop.set_labels(labels)
-        self.device_var.set(labels[0])
-        self._log("USB 设备: " + (", ".join(devices) if devices else "无"))
-        self.refresh_audio_devices(log=True, tidy=False)
-        self._refresh_disks()
-        self._refresh_monitors()
-        self._routes_ready = True
+        # 启动扫描（隐藏端点 + adb 设备 + 音频端点 + 磁盘 + 显示器）统一走
+        # refresh_devices 的后台线程；以前这里在 GUI 线程上重扫一遍，冷启动会
+        # 白卡 1.7 秒，而 _boot_scan 又把同样的事做第二次。
+        self.refresh_devices()
 
     def _save_routes(self) -> None:
         payload = {
@@ -848,6 +815,9 @@ class HostApp:
             "toast_mirror": bool(self.toast_mirror.get()),
             "xiaoai_yield": bool(self.xiaoai_yield.get()),
             "minimize_to_tray": bool(self.minimize_to_tray.get()),
+            "transport": self.transport.get(),
+            "wifi_ip": str(self.wifi_ip.get() or ""),
+            "wifi_token": str(self.wifi_token.get() or ""),
             "pc_disk": self._selected_disk(),
             "pc_monitor": self._selected_monitor_key(),
             "mirror_quality": self.quality_var.get(),
@@ -860,44 +830,106 @@ class HostApp:
             pass
 
     def refresh_audio_devices(self, log: bool = True, tidy: bool = True) -> None:
+        """刷新音频设备列表。
+
+        枚举端点要过 COM + PortAudio，本机实测约 4.9 秒；放在 GUI 线程里就是
+        "点一下按钮，窗口卡住四五秒"。统一改成后台线程收集、回主线程填界面。
+        """
+        self._run_in_worker(
+            "lx04-audio-scan",
+            lambda: self._gather_audio_devices(tidy),
+            lambda data: self._apply_audio_devices(data, log),
+        )
+
+    def _run_in_worker(self, name: str, work, done) -> None:
+        """在后台线程执行 work()，再回到 GUI 线程执行 done(result)。"""
+        def runner() -> None:
+            import comtypes
+
+            comtypes.CoInitialize()
+            try:
+                result = work()
+            except Exception as exc:
+                self._ui(lambda e=exc, n=name: self._log(f"{n} 失败: {e}"))
+                return
+            finally:
+                try:
+                    comtypes.CoUninitialize()
+                except Exception:
+                    pass
+            self._ui(lambda: done(result))
+
+        threading.Thread(target=runner, daemon=True, name=name).start()
+
+    def _gather_audio_devices(self, tidy: bool) -> dict:
+        """只做枚举，不碰任何界面对象（可在任意线程调用）。"""
+        data: dict = {"hidden": [], "inject": [], "spk": [], "vb": False, "hifi": False}
         if tidy:
-            hidden = win_endpoint.tidy_cable_endpoints()
-            if log and hidden:
-                self._log("已从系统播放列表隐藏：" + "、".join(hidden))
-        previous_inject = self.inject_var.get() or getattr(self, "_saved_inject", "")
-        previous_spk = self.spk_dev_var.get() or getattr(self, "_saved_spk", "")
+            try:
+                data["hidden"] = win_endpoint.tidy_cable_endpoints()
+            except Exception:
+                pass
+        ks = None
+        cable = None
+        try:
+            ks = find_hidden_cable_ks_output()
+            cable = win_endpoint.find_cable_render()
+        except Exception:
+            pass
         inject_items: list[tuple[str, str | int, str]] = []
-        ks = find_hidden_cable_ks_output()
-        cable = win_endpoint.find_cable_render()
         other_sd: list[tuple[str, str | int, str]] = []
-        for index, name in self.sink.list_playback_devices():
-            item = ("sd", index, name)
-            if win_endpoint.is_cable_render(name):
-                inject_items.append(item)
-            else:
-                other_sd.append(item)
+        try:
+            for index, name in self.sink.list_playback_devices():
+                item = ("sd", index, name)
+                if win_endpoint.is_cable_render(name):
+                    inject_items.append(item)
+                else:
+                    other_sd.append(item)
+        except Exception:
+            pass
         if ks is not None:
             label = (cable.FriendlyName if cable is not None else "CABLE Input") + "  [隐藏]"
             inject_items.append(("hidden", ks[0], label))
         inject_items.extend(other_sd)
-        self._inject_devices = inject_items
+        data["inject"] = inject_items
+        try:
+            data["spk"] = win_endpoint.list_render_endpoints()
+        except Exception:
+            data["spk"] = []
+        try:
+            data["vb"] = bool(vb_cable.present())
+            data["hifi"] = bool(hifi_cable.present())
+        except Exception:
+            pass
+        return data
+
+    def _apply_audio_devices(self, data: dict, log: bool) -> None:
+        """把枚举结果填进界面（必须在 GUI 线程调用）。"""
+        hidden = data.get("hidden") or []
+        if log and hidden:
+            self._log("已从系统播放列表隐藏：" + "、".join(hidden))
+        inject_items = data.get("inject") or []
+        self._inject_devices = list(inject_items)
         inject_labels = [label for _kind, _handle, label in inject_items]
         self.inject_drop.set_labels(inject_labels)
-        preferred = inject_labels[0] if inject_labels else None
-        chosen = _pick_label(inject_labels, previous_inject, preferred)
+        previous_inject = self.inject_var.get() or getattr(self, "_saved_inject", "")
+        chosen = _pick_label(inject_labels, previous_inject,
+                             inject_labels[0] if inject_labels else None)
         if chosen:
             self.inject_var.set(chosen)
-        self._spk_devices = win_endpoint.list_render_endpoints()
+        self._spk_devices = list(data.get("spk") or [])
         spk_labels = [name for _device_id, name in self._spk_devices]
         self.spk_drop.set_labels(spk_labels)
-        hifi = next((name for _device_id, name in self._spk_devices if hifi_cable.is_hifi_render(name)), None)
+        hifi = next((name for _device_id, name in self._spk_devices
+                     if hifi_cable.is_hifi_render(name)), None)
+        previous_spk = self.spk_dev_var.get() or getattr(self, "_saved_spk", "")
         chosen_spk = _pick_label(spk_labels, previous_spk, hifi)
         if chosen_spk:
             self.spk_dev_var.set(chosen_spk)
         if log:
-            if vb_cable.present():
+            if data.get("vb"):
                 self._log("麦克风建议：隐藏的 CABLE Input，微信选 CABLE Output。")
-            if hifi_cable.present():
+            if data.get("hifi"):
                 self._log("扬声器建议：Hi-Fi Cable Input。")
 
     def _on_xiaoai_yield_change(self) -> None:
@@ -978,12 +1010,16 @@ class HostApp:
 
     def _push_sys_rotation(self) -> None:
         rot = adb_usb.clamp_rotation(self.sys_rotation.get())
-        serial = self._serial or ""
-        if self.adb and serial:
-            try:
-                adb_usb.set_user_rotation(self.adb, rot, serial)
-            except Exception as exc:
-                self._log("系统旋转未写入: " + str(exc))
+        target = self._adb_target()
+        if target:
+            # adb 调用最坏会卡到超时（8 秒），不能放在 GUI 线程上。
+            def write_rotation() -> None:
+                try:
+                    adb_usb.set_user_rotation(target[0], rot, target[1])
+                except Exception as exc:
+                    self._ui(lambda e=exc: self._log("系统旋转未写入: " + str(e)))
+
+            threading.Thread(target=write_rotation, daemon=True, name="lx04-rotate").start()
         if not self.connected:
             return
         self.client.send_control("sys_rotation", rot=rot)
@@ -1001,18 +1037,23 @@ class HostApp:
 
     def _push_ui_hidden(self) -> None:
         hidden = bool(self.ui_hidden.get())
-        serial = self._serial or ""
         if self.connected:
             self.client.send_control("hide_ui", on=hidden)
-        if not (self.adb and serial):
+        target = self._adb_target()
+        if not target:
             return
-        try:
-            if hidden:
-                adb_usb.hide_bridge_ui(self.adb, serial)
-            else:
-                adb_usb.start_bridge_ui(self.adb, serial)
-        except Exception as exc:
-            self._log("桥接画面切换失败: " + str(exc))
+
+        def switch_ui() -> None:
+            try:
+                if hidden:
+                    adb_usb.hide_bridge_ui(target[0], target[1])
+                else:
+                    adb_usb.start_bridge_ui(target[0], target[1])
+            except Exception as exc:
+                self._ui(lambda e=exc: self._log("桥接画面切换失败: " + str(e)))
+
+        # 同上：adb 调用挪出 GUI 线程。
+        threading.Thread(target=switch_ui, daemon=True, name="lx04-ui-switch").start()
 
     def _on_light_theme_change(self) -> None:
         if not self._routes_ready:
@@ -1053,11 +1094,13 @@ class HostApp:
             return saved[:1].upper() + ":" if saved[:1].isalpha() else saved
         return pc_stats.default_disk()
 
-    def _refresh_disks(self) -> None:
+    def _gather_disks(self) -> dict:
         previous = self._selected_disk()
-        items = pc_stats.list_disks()
+        try:
+            items = pc_stats.list_disks()
+        except Exception:
+            items = []
         labels = [pc_stats.disk_choice_label(item) for item in items]
-        self.disk_drop.set_labels(labels)
         chosen = ""
         want = (previous or getattr(self, "_saved_disk", "") or "").upper()[:2]
         for item, label in zip(items, labels):
@@ -1067,24 +1110,43 @@ class HostApp:
         if not chosen:
             system = next((label for item, label in zip(items, labels) if item.get("system")), "")
             chosen = system or (labels[0] if labels else "")
-        if chosen:
-            self.disk_var.set(chosen)
+        return {"labels": labels, "chosen": chosen}
 
-    def _refresh_monitors(self) -> None:
+    def _apply_disks(self, data: dict) -> None:
+        data = data or {}
+        labels = list(data.get("labels") or [])
+        self.disk_drop.set_labels(labels)
+        if data.get("chosen"):
+            self.disk_var.set(str(data["chosen"]))
+
+    def _gather_monitors(self) -> dict:
         previous = self._selected_monitor_key() or getattr(self, "_saved_monitor", "")
         try:
-            self._monitors = screen_mirror.list_monitors()
+            monitors = screen_mirror.list_monitors()
         except Exception:
-            self._monitors = []
-        labels = [item.label() for item in self._monitors]
+            monitors = []
+        labels = [item.label() for item in monitors]
+        chosen = screen_mirror.pick_monitor(monitors, previous)
+        return {"monitors": monitors, "labels": labels,
+                "chosen": chosen.label() if chosen else (labels[0] if labels else ""),
+                "key": chosen.key if chosen else ""}
+
+    def _apply_monitors(self, data: dict) -> None:
+        data = data or {}
+        self._monitors = list(data.get("monitors") or [])
+        labels = list(data.get("labels") or [])
         if hasattr(self, "monitor_drop"):
             self.monitor_drop.set_labels(labels or ["没有显示器"])
-        chosen = screen_mirror.pick_monitor(self._monitors, previous)
-        if chosen:
-            self.monitor_var.set(chosen.label())
-            self._saved_monitor = chosen.key
-        elif labels:
-            self.monitor_var.set(labels[0])
+        if data.get("chosen"):
+            self.monitor_var.set(str(data["chosen"]))
+        if data.get("key"):
+            self._saved_monitor = str(data["key"])
+
+    def _refresh_disks(self) -> None:
+        self._apply_disks(self._gather_disks())
+
+    def _refresh_monitors(self) -> None:
+        self._apply_monitors(self._gather_monitors())
 
     def _selected_monitor_key(self) -> str:
         label = (self.monitor_var.get() or "").strip()
@@ -1403,12 +1465,25 @@ class HostApp:
         self._vol_ignore_pc_until = now + 0.45
         win_volume.set_scalar(level)
 
+    def _hw_stop_args(self) -> tuple:
+        """hw.stop() 的参数：局域网模式不带 adb，避免去杀别的设备的 tinycap。"""
+        target = self._adb_target()
+        return target if target else ()
+
+    def _link_label(self) -> str:
+        mode = self.transport.get()
+        if mode == "wifiadb":
+            return "WiFi 已连接"
+        if mode == "wifi":
+            return "WiFi 直连"
+        return "USB 已连接"
+
     def _apply_mic_route(self, on: bool | None = None, inject=None, grab: bool | None = None) -> None:
         if on is None:
             on = bool(self.mic_enabled.get())
         if not on:
             self._stop_xiaoai_watch()
-            self.hw.stop(self.adb, self._serial)
+            self.hw.stop(*self._hw_stop_args())
             self.sink.stop()
             self._apk_mic = False
             self._release_xiaoai_mic(log=True)
@@ -1454,14 +1529,15 @@ class HostApp:
     def _grab_xiaoai_mic(self) -> None:
         self._apk_mic = False
         self.sink.configure(48000, 1)
-        if self.adb and self._serial and not self._xiaoai_held:
-            self._log(adb_usb.take_speaker_mic(self.adb, self._serial))
+        target = self._adb_target()
+        if target and not self._xiaoai_held:
+            self._log(adb_usb.take_speaker_mic(target[0], target[1]))
             self._xiaoai_held = True
             time.sleep(0.2)
         self._yield_gate.reset(True)
-        if self.adb and self._serial and not self.hw.running():
+        if target and not self.hw.running():
             try:
-                self.hw.start(self.adb, self._serial, self.sink)
+                self.hw.start(target[0], target[1], self.sink)
                 self.sink.configure(48000, 1)
                 self._log("已从音箱数字麦直采：48kHz 单声道（tinycap pcmC0D1c）")
                 self.client.send_control("stop_mic")
@@ -1469,6 +1545,12 @@ class HostApp:
                 self._apk_mic = True
                 self._log("硬件直采失败，回退 APK 麦克风: " + str(exc))
                 self.client.send_control("start_mic")
+        if not target:
+            # 局域网（WiFi）模式没有 adb：硬件 tinycap 与小爱让位都不可用，
+            # 直接走 APK 采集，否则"麦克风 → 电脑"会整条静默失效。
+            self._apk_mic = True
+            self.client.send_control("start_mic")
+            self._log("局域网模式：麦克风走 APK 采集（直采硬件麦需要数据线）")
         self._set_xiaoai_idle(False)
 
     def _yield_xiaoai_mic(self) -> None:
@@ -1477,7 +1559,7 @@ class HostApp:
         was_held = self._xiaoai_held or self.hw.running()
         was_idle = self._xiaoai_idle
         if self.hw.running():
-            self.hw.stop(self.adb, self._serial)
+            self.hw.stop(*self._hw_stop_args())
         try:
             self.client.send_control("stop_mic")
         except Exception:
@@ -1493,9 +1575,10 @@ class HostApp:
     def _release_xiaoai_mic(self, log: bool = False) -> None:
         if not self._xiaoai_held:
             return
-        if self.adb and self._serial:
+        target = self._adb_target()
+        if target:
             try:
-                msg = adb_usb.release_speaker_mic(self.adb, self._serial)
+                msg = adb_usb.release_speaker_mic(target[0], target[1])
                 if log:
                     self._log(msg)
             except Exception as exc:
@@ -1863,89 +1946,279 @@ class HostApp:
             self.client.send_control("gain", gain=round(gain, 3))
 
     def refresh_devices(self) -> None:
-        if not self.adb:
-            self.device_drop.set_labels(["未找到 adb"])
-            self.device_var.set("未找到 adb")
-            self._refresh_disks()
+        """刷新设备列表（adb / 音频端点 / 磁盘 / 显示器）。
+
+        以前这一整串都在 GUI 线程里跑：`adb devices` 最坏 8 秒超时，端点枚举实测
+        约 4.9 秒，合起来点一次按钮界面就定住四五秒（adb 异常时十几秒）。现在全部
+        放到工作线程，界面只负责最后填列表。
+        """
+        if self._refreshing:
             return
+        self._refreshing = True
+        self._run_in_worker("lx04-refresh", self._gather_everything, self._apply_everything)
+
+    def _gather_everything(self) -> dict:
+        devices: list[str] = []
+        err = ""
+        if self.adb:
+            try:
+                devices = adb_usb.list_devices(self.adb)
+            except Exception as exc:
+                err = str(exc)
+        data = self._gather_audio_devices(tidy=True)
+        data["devices"] = devices
+        data["err"] = err
+        data["disks"] = self._gather_disks()
+        data["monitors"] = self._gather_monitors()
+        return data
+
+    def _apply_everything(self, data: dict) -> None:
         try:
-            self.devices = adb_usb.list_devices(self.adb)
-        except Exception as exc:
-            self._log("读取 adb 设备失败: " + str(exc))
-            self.devices = []
-        labels = self.devices or ["没有 USB 设备（检查数据线 / USB 调试）"]
-        self.device_drop.set_labels(labels)
-        self.device_var.set(labels[0])
-        self._log("USB 设备: " + (", ".join(self.devices) if self.devices else "无"))
-        self.refresh_audio_devices(log=False)
-        self._refresh_disks()
-        self._refresh_monitors()
+            if self._closing:
+                return
+            self.devices = list(data.get("devices") or [])
+            labels = (["未找到 adb"] if not self.adb
+                      else (self.devices or ["没有 USB 设备（检查数据线 / USB 调试）"]))
+            self.device_drop.set_labels(labels)
+            self.device_var.set(labels[0])
+            if self.adb:
+                self._log("USB 设备: " + (", ".join(self.devices) if self.devices else "无"))
+                if data.get("err"):
+                    self._log("读取 adb 设备失败: " + str(data["err"]))
+            # 没有 adb 时也要把音频端点/磁盘/显示器列表填好。
+            self._apply_audio_devices(data, log=False)
+            self._apply_disks(data.get("disks"))
+            self._apply_monitors(data.get("monitors"))
+        finally:
+            self._refreshing = False
+
+    @property
+    def wifi_adb(self) -> bool:
+        """走无线 ADB（adb tcpip/connect）——WiFi 下功能与 USB 完全一致。"""
+        return self.transport.get() == "wifiadb"
+
+    def _adb_target(self) -> tuple[str, str] | None:
+        """当前可用的 (adb, serial)；直连局域网模式返回 None。
+
+        - USB：串口来自设备下拉框。
+        - 无线 ADB：串口是 `IP:5555`，其余流程与 USB 完全一样。
+        - 直连局域网：没有 adb，依赖数据线的功能全部跳过。
+        """
+        mode = self.transport.get()
+        if mode not in ("usb", "wifiadb") or not self.adb:
+            return None
+        serial = self._serial or ""
+        return (self.adb, serial) if serial else None
 
     def connect(self) -> None:
-        if not self.adb:
-            self.bridge.showerror("没有找到内置 adb。请重新打包上位机。")
+        """连接音箱。
+
+        adb 准备 + 三通道握手全部放到工作线程：本机实测这一步在
+        `enable_usb_microphone` 7.9s + `ensure_bridge_running` 15.9s +
+        `usb_forward` 8.1s + `_connect_tcp` 18.2s ≈ 50 秒，放在 GUI 线程上
+        就是"点一下连接，窗口假死一分钟"。
+        """
+        if self._connecting:
             return
+        self._connecting = True
+        self.headline.configure(text="正在连接…")
+        self.detail.configure(text="正在准备 adb / TCP 通道，界面可以继续操作")
+        threading.Thread(target=self._connect_worker, daemon=True, name="lx04-connect").start()
+
+    def _connect_worker(self) -> None:
+        mode = self.transport.get()
+        try:
+            if mode == "wifiadb":
+                serial, detail = self._open_wifi_adb()
+            elif mode == "wifi":
+                serial, detail = self._open_wifi_lan()
+            else:
+                serial, detail = self._open_usb()
+        except Exception as exc:
+            self._ui(lambda e=exc: self._connect_failed(e))
+            return
+        self._ui(lambda: self._connect_done(serial, detail))
+
+    def _open_usb(self) -> tuple[str, str]:
+        """USB：adb 准备 + 端口转发 + 三通道握手（工作线程内执行）。"""
+        if not self.adb:
+            raise RuntimeError("没有找到内置 adb。请重新打包上位机。")
         serial = self.device_var.get()
         if not self.devices or serial.startswith("没有") or serial.startswith("未找到"):
-            self.bridge.showerror("没有可用的 USB 设备。请拔掉数据线再插上，并打开 USB 调试。")
-            return
+            raise RuntimeError("没有可用的 USB 设备。请拔掉数据线再插上，并打开 USB 调试。")
+        gadget = adb_usb.enable_usb_microphone(self.adb, serial)
+        if gadget:
+            self._log("USB 功能: " + " ".join(gadget.split()))
+        self._log(adb_usb.ensure_bridge_running(self.adb, serial))
+        adb_usb.usb_forward(self.adb, serial)
+        self._connect_tcp(serial)
+        return serial, f"{serial} · USB 数据线"
+
+    def _open_wifi_adb(self) -> tuple[str, str]:
+        """无线 ADB：先 adb connect 音箱的 IP，再走与 USB 完全相同的流程。
+
+        Android 8.1 没有无线调试配对，但 `adb tcpip 5555` 从很早就有：插一次线
+        激活后 adbd 会一直监听 TCP，直到音箱重启。
+        """
+        if not self.adb:
+            raise RuntimeError("没有找到内置 adb。请重新打包上位机。")
+        ip = str(self.wifi_ip.get() or "").strip()
+        if not ip:
+            raise RuntimeError("请先填写音箱的局域网 IP（音箱「系统设置」里可以看到）。")
+        serial = adb_usb.wifi_serial(ip)
+        self._log(adb_usb.connect_wifi(self.adb, ip))
+        if serial not in adb_usb.list_devices(self.adb):
+            # 还没激活过 TCP 模式：如果此刻插着数据线就顺手激活一次。
+            usb_devices = [d for d in adb_usb.list_devices(self.adb) if ":" not in d]
+            if usb_devices:
+                self._log(adb_usb.enable_tcpip(self.adb, usb_devices[0]))
+                time.sleep(1.0)
+                self._log(adb_usb.connect_wifi(self.adb, ip))
+            if serial not in adb_usb.list_devices(self.adb):
+                raise RuntimeError(
+                    f"{ip} 上的 adb 没有监听 TCP：请先插一次数据线执行 adb tcpip 5555，"
+                    "或改用「WiFi · 直连」模式。")
+        self._log(f"无线 ADB 已连上 {serial}")
+        self._log(adb_usb.ensure_bridge_running(self.adb, serial))
+        adb_usb.usb_forward(self.adb, serial)
+        self._connect_tcp(serial)
+        return serial, f"{serial} · 无线 ADB（不占用数据线）"
+
+    def _open_wifi_lan(self) -> tuple[str, str]:
+        """直连局域网：不走 adb，三通道直连 + 配对鉴权（工作线程内执行）。"""
+        ip = str(self.wifi_ip.get() or "").strip()
+        if not ip:
+            raise RuntimeError("请先扫描，或填写音箱的局域网 IP。")
+        ok, detail = self._wifi_open(ip)
+        if not ok:
+            raise RuntimeError(detail)
+        return "", detail
+
+    def _connect_done(self, serial: str, detail: str) -> None:
+        """握手成功后在 GUI 线程收尾（音频通路初始化 + 界面文案）。"""
+        self._connecting = False
+        self._serial = serial
+        self._session = True
+        self.connected = True
         try:
-            gadget = adb_usb.enable_usb_microphone(self.adb, serial)
-            if gadget:
-                self._log("USB 功能: " + " ".join(gadget.split()))
-            self._log(adb_usb.ensure_bridge_running(self.adb, serial))
-            adb_usb.usb_forward(self.adb, serial)
-            self._connect_tcp(serial)
-            self._session = True
-            self.connected = True
-            self._serial = serial
-            self._xiaoai_held = False
-            self._yield_gate.reset(False)
-            if self.mic_enabled.get():
-                self._apply_mic_route()
-            else:
-                self._log("麦克风通路已关闭。")
-            self._on_gain()
-            self.client.send_control("gain", gain=round(self.sink.gain, 3))
-            if self.volume_sync.get():
-                self._push_pc_volume(force=True)
-            self._spawn_stats(force=True)
-            self._push_upside_down()
-            self._push_sys_rotation()
-            self._push_ui_hidden()
-            self._begin_hud_reconcile()
-            if self.spk_enabled.get():
-                self._apply_speaker_route()
-            else:
-                self._log("扬声器通路已关闭。可用「音箱试音」检查喇叭。")
-            self._sync_toast_mirror()
-            self.headline.configure(
-                text="空闲中，可呼出小爱" if self._xiaoai_idle else "USB 已连接"
-            )
+            self._start_session()
         except Exception as exc:
-            self._session = False
-            self.connected = False
-            self._restore_render()
-            try:
-                self.client.close()
-            except Exception:
-                pass
-            try:
-                self.toast.stop()
-            except Exception:
-                pass
-            try:
-                self.hw.stop(self.adb, serial)
-            except Exception:
-                pass
+            self._log("音频通路初始化失败: " + str(exc))
+        self.headline.configure(
+            text="空闲中，可呼出小爱" if self._xiaoai_idle else self._link_label()
+        )
+        self.detail.configure(text=detail)
+
+    def _start_session(self) -> None:
+        """两条传输方式共用的连接后初始化。"""
+        self._xiaoai_held = False
+        self._yield_gate.reset(False)
+        if self.mic_enabled.get():
+            self._apply_mic_route()
+        else:
+            self._log("麦克风通路已关闭。")
+        self._on_gain()
+        self.client.send_control("gain", gain=round(self.sink.gain, 3))
+        if self.volume_sync.get():
+            self._push_pc_volume(force=True)
+        self._spawn_stats(force=True)
+        self._push_upside_down()
+        self._push_sys_rotation()
+        self._push_ui_hidden()
+        self._begin_hud_reconcile()
+        if self.spk_enabled.get():
+            self._apply_speaker_route()
+        else:
+            self._log("扬声器通路已关闭。可用「音箱试音」检查喇叭。")
+        self._sync_toast_mirror()
+
+    def _connect_failed(self, exc: Exception, serial: str = "") -> None:
+        self._connecting = False
+        self._session = False
+        self.connected = False
+        self._restore_render()
+        try:
+            self.client.close()
+        except Exception:
+            pass
+        try:
+            self.toast.stop()
+        except Exception:
+            pass
+        try:
+            self.hw.stop(self.adb, serial)
+        except Exception:
+            pass
+        if self.transport.get() != "wifi" and self.adb:
             try:
                 adb_usb.release_speaker_mic(self.adb, serial)
             except Exception:
                 pass
-            self.bridge.showerror(str(exc))
-            self._log("连接失败: " + str(exc))
-            self.headline.configure(text="连接失败")
-            self.detail.configure(text="无法连接到 LX04。")
+        self.bridge.showerror(str(exc))
+        self._log("连接失败: " + str(exc))
+        self.headline.configure(text="连接失败")
+        self.detail.configure(text="无法连接到 LX04。")
+
+    def _wifi_open(self, ip: str) -> tuple[bool, str]:
+        """连上三条 TCP 通道并完成局域网鉴权，返回 (是否成功, 说明)。"""
+        token = str(self.wifi_token.get() or "").strip()
+        code = str(self.wifi_code.get() or "").strip()
+        if not token and not code:
+            return False, "还没有配对：请在音箱上开启 WiFi 配对模式，再填 IP 与配对码。"
+        attempts: list[tuple[str, str]] = []
+        if token:
+            attempts.append(("token", token))
+        if code:
+            attempts.append(("code", code))
+        last = ""
+        for kind, secret in attempts:
+            try:
+                self.client.connect(ip, protocol.PORT)
+            except Exception as exc:
+                return False, f"连不上 {ip}:{protocol.PORT}（{exc}）"
+            try:
+                self._wifi_auth(kind, secret)
+            except Exception as exc:
+                # 鉴权失败时音箱会立刻关闭连接，换下一种凭据重连再试。
+                last = str(exc)
+                continue
+            try:
+                self.client.connect_video(ip, protocol.VIDEO_PORT)
+            except Exception:
+                pass
+            toast_ok = False
+            for toast_try in range(4):
+                if self.client.connect_toast(ip, protocol.TOAST_PORT):
+                    toast_ok = True
+                    break
+                time.sleep(0.12 * (toast_try + 1))
+            self._log("系统弹窗走独立通道 17892" if toast_ok
+                      else "系统弹窗通道 17892 未接通，暂走 17890")
+            return True, f"WiFi 已连接 {ip}" + ("（免配对码）" if kind == "token" else "（已配对）")
+        return False, last or "WiFi 连接失败"
+
+    def _wifi_auth(self, kind: str, secret: str) -> None:
+        """在刚连上的 17890 通道上完成首帧鉴权；失败抛异常。"""
+        wait = threading.Event()
+        self._wifi_auth_result = {}
+        self._wifi_auth_wait = wait
+        try:
+            fields = {"token" if kind == "token" else "code": secret,
+                      "name": socket.gethostname()}
+            self.client.send_control("wifi_auth", **fields)
+            if not wait.wait(8.0):
+                raise RuntimeError("音箱没有回应配对校验，请确认已开启 WiFi 配对模式")
+            result = dict(self._wifi_auth_result)
+        finally:
+            self._wifi_auth_wait = None
+        if not result.get("ok"):
+            if kind == "token":
+                raise RuntimeError("配对令牌已失效，需要用配对码重新配对")
+            raise RuntimeError("配对码不正确，请照音箱屏幕上显示的重填")
+        fresh = str(result.get("token") or "")
+        if fresh:
+            self.wifi_token.set(fresh)
+            self._save_routes()
 
     def _connect_tcp(self, serial: str) -> None:
         last_err: Exception | None = None
@@ -1992,33 +2265,34 @@ class HostApp:
         threading.Thread(target=self._shutdown_work, daemon=True, name="lx04-disc").start()
 
     def _shutdown_work(self) -> None:
-        with self._stop_lock:
+        # 每一步各自兜底：以前用一个大 try 包住，hw.stop() 一抛异常就会跳过
+        # sink/渲染恢复，把系统默认播放设备永久留在 CABLE 上（电脑没声音）。
+        def step(fn, *args, **kwargs) -> None:
             try:
-                self.client.close()
-                if self._serial:
-                    self.hw.stop(self.adb, self._serial)
-                else:
-                    self.hw.stop()
-                self.sink.stop()
-                self._restore_render(log=not self._closing)
-                self.mirror.stop()
-                self.toast.stop()
-                if self.adb and self._serial:
-                    try:
-                        msg = adb_usb.release_speaker_mic(self.adb, self._serial)
-                        self._xiaoai_held = False
-                        if not self._closing:
-                            self._log(msg)
-                    except Exception as exc:
-                        if not self._closing:
-                            self._log("恢复小爱麦失败: " + str(exc))
-            except Exception:
-                pass
-            if self._closing and self.adb:
+                fn(*args, **kwargs)
+            except Exception as exc:
+                if not self._closing:
+                    self._log(f"清理步骤失败（{getattr(fn, '__name__', fn)}）: {exc}")
+
+        with self._stop_lock:
+            step(self.client.close)
+            step(self.hw.stop, *self._hw_stop_args())
+            step(self.sink.stop)
+            step(self._restore_render, log=not self._closing)
+            step(self.mirror.stop)
+            step(self.toast.stop)
+            target = self._adb_target()
+            if target:
                 try:
-                    adb_usb.kill_server(self.adb)
-                except Exception:
-                    pass
+                    msg = adb_usb.release_speaker_mic(target[0], target[1])
+                    self._xiaoai_held = False
+                    if not self._closing:
+                        self._log(msg)
+                except Exception as exc:
+                    if not self._closing:
+                        self._log("恢复小爱麦失败: " + str(exc))
+            if self._closing and self._adb_target():
+                step(adb_usb.kill_server, self.adb)
 
     def _on_close(self, force: bool = False) -> None:
         if _close_goes_to_tray(self._closing, force, bool(self.minimize_to_tray.get())):
@@ -2028,6 +2302,8 @@ class HostApp:
         self._stop_xiaoai_watch()
         self._session = False
         self.connected = False
+        # 立刻放掉单实例互斥体：否则"关掉后马上再打开"的新实例会静默退出。
+        _release_single_instance()
         self._tray_remove()
         if getattr(self, "bridge", None) is not None and getattr(self.bridge, "_hud_win", None) is not None:
             try:
@@ -2271,28 +2547,53 @@ class HostApp:
                     self._reviving = False
                     return
                 try:
-                    serial = self._serial
-                    status = adb_usb.ensure_bridge_running(self.adb, serial)
-                    self.root.after(0, lambda s=status: self._log(s))
-                    try:
-                        if self.mic_enabled.get() and self._xiaoai_held:
-                            adb_usb.take_speaker_mic(self.adb, serial)
-                    except Exception:
-                        pass
-                    adb_usb.usb_forward(self.adb, serial)
-                    time.sleep(0.4)
-                    if not self._session:
-                        self._reviving = False
-                        return
-                    self.client.connect("127.0.0.1", protocol.PORT)
-                    try:
-                        self.client.connect_video("127.0.0.1", protocol.VIDEO_PORT)
-                    except Exception:
-                        pass
-                    for toast_try in range(4):
-                        if self.client.connect_toast("127.0.0.1", protocol.TOAST_PORT):
-                            break
-                        time.sleep(0.12 * (toast_try + 1))
+                    if self.transport.get() == "wifi":
+                        ok, detail = self._wifi_open(str(self.wifi_ip.get() or "").strip())
+                        if not ok:
+                            raise RuntimeError(detail)
+                        self.root.after(0, lambda d=detail: self._log(d))
+                    elif self.wifi_adb:
+                        ip = str(self.wifi_ip.get() or "").strip()
+                        adb_usb.connect_wifi(self.adb, ip)
+                        serial = adb_usb.wifi_serial(ip)
+                        if serial not in adb_usb.list_devices(self.adb):
+                            raise RuntimeError(f"{ip} 上的 adb 不可达（音箱可能重启过，需要插一次线）")
+                        self._serial = serial
+                        adb_usb.ensure_bridge_running(self.adb, serial)
+                        adb_usb.usb_forward(self.adb, serial)
+                        self.client.connect("127.0.0.1", protocol.PORT)
+                        try:
+                            self.client.connect_video("127.0.0.1", protocol.VIDEO_PORT)
+                        except Exception:
+                            pass
+                        for toast_try in range(4):
+                            if self.client.connect_toast("127.0.0.1", protocol.TOAST_PORT):
+                                break
+                            time.sleep(0.12 * (toast_try + 1))
+                        self.root.after(0, lambda s=serial: self._log("无线 ADB 重连成功 " + s))
+                    else:
+                        serial = self._serial
+                        status = adb_usb.ensure_bridge_running(self.adb, serial)
+                        self.root.after(0, lambda s=status: self._log(s))
+                        try:
+                            if self.mic_enabled.get() and self._xiaoai_held:
+                                adb_usb.take_speaker_mic(self.adb, serial)
+                        except Exception:
+                            pass
+                        adb_usb.usb_forward(self.adb, serial)
+                        time.sleep(0.4)
+                        if not self._session:
+                            self._reviving = False
+                            return
+                        self.client.connect("127.0.0.1", protocol.PORT)
+                        try:
+                            self.client.connect_video("127.0.0.1", protocol.VIDEO_PORT)
+                        except Exception:
+                            pass
+                        for toast_try in range(4):
+                            if self.client.connect_toast("127.0.0.1", protocol.TOAST_PORT):
+                                break
+                            time.sleep(0.12 * (toast_try + 1))
                     if not self._session:
                         self.client.close()
                         self._reviving = False
@@ -2314,7 +2615,7 @@ class HostApp:
             return
         self.connected = True
         self.headline.configure(
-            text="空闲中，可呼出小爱" if self._xiaoai_idle else "USB 已连接"
+            text="空闲中，可呼出小爱" if self._xiaoai_idle else self._link_label()
         )
         self.detail.configure(text="后台服务已恢复，音箱窗口无需打开。")
         self._log("已重新拉起音箱后台服务（未打开窗口）")
@@ -2381,6 +2682,13 @@ class HostApp:
         if kind == "event":
             data = data if isinstance(data, dict) else {}
             cmd = str(data.get("cmd") or "")
+            if cmd == "wifi_auth":
+                # 局域网鉴权结果：唤醒正在等待的 _wifi_auth()。
+                self._wifi_auth_result = data
+                wait = self._wifi_auth_wait
+                if wait is not None:
+                    wait.set()
+                return
             if cmd == "toast_ack":
                 title = str(data.get("title") or "")
                 if data.get("on"):
@@ -2517,41 +2825,52 @@ class HostApp:
             self._begin_revive()
 
     def _tick(self) -> None:
-        if self._closing:
-            return
-        if _poll_activate_event():
+        # 整个函数体都要兜底：以前只有"重新挂定时器"那一句在 try 里，
+        # 中途任何一次异常都会让 80ms 心跳永久停摆（电平条不动、音量同步失效、
+        # 状态栏不再更新），而且没有任何日志。
+        try:
+            if self._closing:
+                return
+            if _poll_activate_event():
+                try:
+                    _show_host_window(self.root.window)
+                    self._log("已切换到正在运行的上位机")
+                except Exception:
+                    pass
+            spk = self.loopback.peak if self.loopback.running() else self.play_peak
+            self._draw_meter("mic", self.sink.peak if self.connected else 0)
+            self._draw_meter("spk", spk if self.connected else 0)
+            if not self.loopback.running():
+                self.play_peak *= 0.82
+            self._push_pc_volume()
+            self._stats_ticks += 1
+            if self._stats_ticks >= 12:
+                self._stats_ticks = 0
+                self._spawn_stats()
+            if self.mirror.error:
+                self._log("屏幕镜像: " + self.mirror.error)
+                self.mirror.error = ""
+            if self.mirror.running() and self.mirror.frames and not self._mirror_logged:
+                self._mirror_logged = True
+                self._log("屏幕镜像已出画面: " + (self.mirror.title or self.monitor_var.get()))
+            if self.toast.error:
+                self._log("系统弹窗: " + self.toast.error)
+                self.toast.error = ""
+            if self._tray_hwnd and time.monotonic() - self._tray_ping_at > 3:
+                self._tray_ping_at = time.monotonic()
+                self._tray_ping()
+            self.bridge.sync_screen()
+        except Exception as exc:
             try:
-                _show_host_window(self.root.window)
-                self._log("已切换到正在运行的上位机")
+                self._log("心跳异常（已继续运行）: " + repr(exc))
             except Exception:
                 pass
-        spk = self.loopback.peak if self.loopback.running() else self.play_peak
-        self._draw_meter("mic", self.sink.peak if self.connected else 0)
-        self._draw_meter("spk", spk if self.connected else 0)
-        if not self.loopback.running():
-            self.play_peak *= 0.82
-        self._push_pc_volume()
-        self._stats_ticks += 1
-        if self._stats_ticks >= 12:
-            self._stats_ticks = 0
-            self._spawn_stats()
-        if self.mirror.error:
-            self._log("屏幕镜像: " + self.mirror.error)
-            self.mirror.error = ""
-        if self.mirror.running() and self.mirror.frames and not self._mirror_logged:
-            self._mirror_logged = True
-            self._log("屏幕镜像已出画面: " + (self.mirror.title or self.monitor_var.get()))
-        if self.toast.error:
-            self._log("系统弹窗: " + self.toast.error)
-            self.toast.error = ""
-        if self._tray_hwnd and time.monotonic() - self._tray_ping_at > 3:
-            self._tray_ping_at = time.monotonic()
-            self._tray_ping()
-        self.bridge.sync_screen()
-        try:
-            self.root.after(80, self._tick)
-        except Exception:
-            return
+        finally:
+            if not self._closing:
+                try:
+                    self.root.after(80, self._tick)
+                except Exception:
+                    pass
 
     def _draw_meter(self, which: str, level: float) -> None:
         if which == "mic":

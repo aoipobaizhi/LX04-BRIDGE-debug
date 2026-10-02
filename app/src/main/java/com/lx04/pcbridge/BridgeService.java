@@ -15,6 +15,10 @@ import android.provider.Settings;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.Socket;
+
 public class BridgeService extends Service {
     public static final BridgeState STATE = new BridgeState();
     private static BridgeService instance;
@@ -28,6 +32,7 @@ public class BridgeService extends Service {
     private PowerManager.WakeLock wakeLock;
     private long lastAudioMs;
     private static AudioManager audioManager;
+    private static android.media.AudioManager.OnAudioFocusChangeListener audioFocus;
 
     @Override
     public void onCreate() {
@@ -71,6 +76,8 @@ public class BridgeService extends Service {
                     STATE.mirrorTitle = "";
                     STATE.toastOverlay = false;
                     STATE.toastTitle = "";
+                    STATE.clientIsLan = false;
+                    refreshWifiState();
                 }
                 if (connected) {
                     playback.start();
@@ -99,8 +106,33 @@ public class BridgeService extends Service {
             }
 
             @Override
+            public boolean authorize(Socket socket, InputStream in, OutputStream out) {
+                String token = WifiPairServer.INSTANCE.authorize(socket, in, out);
+                if (token == null) {
+                    STATE.clientIsLan = false;
+                    refreshWifiState();
+                    return false;
+                }
+                STATE.clientIsLan = true;
+                STATE.wifiPaired = true;
+                refreshWifiState();
+                return true;
+            }
+
+            @Override
             public void onControl(JSONObject json) {
                 String cmd = json.optString("cmd", "");
+                if ("wifi_pair".equals(cmd)) {
+                    WifiPairServer.INSTANCE.setPairing(json.optBoolean("on", true));
+                    refreshWifiState();
+                    return;
+                }
+                if ("wifi_forget".equals(cmd)) {
+                    // 上位机点「清除配对」：音箱也忘掉 token，否则局域网监听会一直开着。
+                    WifiPairServer.INSTANCE.forget();
+                    refreshWifiState();
+                    return;
+                }
                 if ("gain".equals(cmd)) {
                     STATE.gain = (float) json.optDouble("gain", 1.0);
                     if (STATE.gain < 0f) {
@@ -169,6 +201,9 @@ public class BridgeService extends Service {
             refreshHeadline();
         });
         usbMonitor.start();
+        WifiPairServer.INSTANCE.attach(this, BridgeService::refreshWifiState);
+        WifiPairServer.INSTANCE.restore();
+        refreshWifiState();
         server.start();
         videoServer.start();
         toastServer.start();
@@ -201,6 +236,7 @@ public class BridgeService extends Service {
         if (server != null) {
             server.stop();
         }
+        WifiPairServer.INSTANCE.stop();
         stopMic();
         if (playback != null) {
             playback.stop();
@@ -468,6 +504,47 @@ public class BridgeService extends Service {
         }
     }
 
+    /** 开关 WiFi（局域网）配对模式；打开时会生成新的配对码。 */
+    public static void setWifiPairing(android.content.Context context, boolean on) {
+        WifiPairServer.INSTANCE.setPairing(on);
+        refreshWifiState();
+    }
+
+    /** 忘掉已配对的上位机，回到"只有 USB 能连"的状态。 */
+    public static void forgetWifiPairing(android.content.Context context) {
+        WifiPairServer.INSTANCE.forget();
+        refreshWifiState();
+    }
+
+    static boolean isWifiPairing() {
+        return WifiPairServer.INSTANCE.pairing();
+    }
+
+    static String wifiPairCode() {
+        return WifiPairServer.INSTANCE.pin();
+    }
+
+    static String wifiIp() {
+        return WifiPairServer.INSTANCE.localIp();
+    }
+
+    /** 把 WifiPairServer 的真实状态同步进 STATE，并刷新屏幕与 STATUS。 */
+    static void refreshWifiState() {
+        WifiPairServer wifi = WifiPairServer.INSTANCE;
+        STATE.wifiPairing = wifi.pairing();
+        STATE.wifiOn = wifi.lanEnabled();
+        STATE.wifiPaired = wifi.hasToken();
+        STATE.wifiIp = wifi.localIp();
+        STATE.wifiPairCode = STATE.wifiPairing ? wifi.pin() : "";
+        STATE.flushStatus = true;
+        if (instance != null) {
+            instance.refreshHeadline();
+        } else {
+            refreshHeadlineStatic();
+        }
+        MainActivity.refreshHud();
+    }
+
     public static void persistHudStyle(android.content.Context context) {
         if (context == null) {
             return;
@@ -634,7 +711,16 @@ public class BridgeService extends Service {
                     (android.media.AudioManager) getSystemService(AUDIO_SERVICE);
             if (am != null) {
                 am.setMicrophoneMute(false);
-                am.requestAudioFocus(null, android.media.AudioManager.STREAM_MUSIC,
+                if (audioFocus == null) {
+                    audioFocus = new android.media.AudioManager.OnAudioFocusChangeListener() {
+                        @Override
+                        public void onAudioFocusChange(int change) {
+                        }
+                    };
+                }
+                // 记下 listener，停止录音时要 abandon，否则焦点一直占着，
+                // 其它播放器会被永久判定为"被抢占"。
+                am.requestAudioFocus(audioFocus, android.media.AudioManager.STREAM_MUSIC,
                         android.media.AudioManager.AUDIOFOCUS_GAIN);
             }
         } else {
@@ -649,6 +735,12 @@ public class BridgeService extends Service {
     private void stopMic() {
         if (capture != null) {
             capture.stop();
+        }
+        if (audioManager != null && audioFocus != null) {
+            try {
+                audioManager.abandonAudioFocus(audioFocus);
+            } catch (Exception ignored) {
+            }
         }
         STATE.recording = false;
         STATE.level = 0f;
@@ -676,12 +768,25 @@ public class BridgeService extends Service {
             STATE.detail = "请授权后重新打开本应用";
             return;
         }
-        if (!STATE.usbConnected) {
-            STATE.headline = "等待 USB";
-            STATE.detail = "用能传数据的 Micro USB 线连接电脑";
-            return;
-        }
         if (!STATE.clientConnected) {
+            // WiFi 配对模式优先：此刻用户要在电脑上照着屏幕输入这些信息。
+            if (STATE.wifiPairing) {
+                String addr = STATE.wifiIp.isEmpty() ? "音箱尚未连上局域网" : STATE.wifiIp;
+                STATE.headline = "WiFi 配对中";
+                STATE.detail = addr + " · 配对码 " + STATE.wifiPairCode;
+                return;
+            }
+            if (STATE.wifiOn && STATE.wifiPaired) {
+                String addr = STATE.wifiIp.isEmpty() ? "音箱未连上局域网" : "音箱地址 " + STATE.wifiIp;
+                STATE.detail = addr + " · 上位机选 WiFi 可直接连接";
+                STATE.headline = "WiFi 待连接";
+                return;
+            }
+            if (!STATE.usbConnected) {
+                STATE.headline = "等待 USB";
+                STATE.detail = "插上数据线，或在音箱菜单里开启 WiFi 配对模式";
+                return;
+            }
             STATE.headline = "USB 已连接";
             STATE.detail = STATE.usbAdb
                     ? "等待上位机（adb forward 17890）"

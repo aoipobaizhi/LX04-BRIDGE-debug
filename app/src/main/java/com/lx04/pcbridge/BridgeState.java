@@ -27,6 +27,13 @@ final class BridgeState {
     volatile String[] toastButtonIds = new String[0];
     volatile String[] toastButtonLabels = new String[0];
     volatile boolean permissionDenied;
+    /** WiFi（局域网）配对相关状态，USB 模式下这些字段保持 false/空。 */
+    volatile boolean wifiPairing;
+    volatile boolean wifiOn;
+    volatile boolean wifiPaired;
+    volatile boolean clientIsLan;
+    volatile String wifiIp = "";
+    volatile String wifiPairCode = "";
     volatile float level;
     volatile float playLevel;
     volatile float volume = 1f;
@@ -76,6 +83,9 @@ final class BridgeState {
     }
 
     String formatLink() {
+        if (clientIsLan) {
+            return "WiFi 局域网";
+        }
         if (!usbConnected) {
             return "USB 未连接";
         }

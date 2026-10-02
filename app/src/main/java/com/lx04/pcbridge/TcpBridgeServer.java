@@ -23,6 +23,12 @@ final class TcpBridgeServer {
         void onControl(JSONObject json);
         void onPlay(byte[] pcm, boolean muted);
         void onFile(int slot, byte[] jpeg);
+
+        /**
+         * 局域网客户端的首帧鉴权（USB / adb forward 的回环客户端不会走到这里）。
+         * 返回 true 放行。
+         */
+        boolean authorize(Socket socket, InputStream in, OutputStream out);
     }
 
     private final BridgeState state;
@@ -35,6 +41,9 @@ final class TcpBridgeServer {
     private Thread acceptThread;
     private volatile Socket client;
     private volatile long dropped;
+    private final AtomicInteger lanClients = new AtomicInteger();
+    /** 局域网鉴权线程上限，避免被同网段的连接把线程数撑爆。 */
+    private static final int MAX_LAN_CLIENTS = 2;
 
     TcpBridgeServer(BridgeState state, Callbacks callbacks) {
         this.state = state;
@@ -115,6 +124,13 @@ final class TcpBridgeServer {
             o.put("uiHidden", state.uiHidden);
             o.put("screenMirror", state.screenMirror);
             o.put("toastOverlay", state.toastOverlay);
+            o.put("clientIsLan", state.clientIsLan);
+            o.put("wifiOn", state.wifiOn);
+            o.put("wifiPairing", state.wifiPairing);
+            o.put("wifiPaired", state.wifiPaired);
+            o.put("wifiIp", state.wifiIp);
+            o.put("wifiPort", Protocol.WIFI_PAIR_PORT);
+            o.put("wifiPairCode", state.wifiPairCode);
             o.put("hudStyle", state.hudStyle.toStatusJson());
             JSONObject bg = new JSONObject();
             bg.put("sel", HudBackground.INSTANCE.selected());
@@ -143,27 +159,63 @@ final class TcpBridgeServer {
 
     private void acceptLoop() {
         try {
-            server = new ServerSocket(Protocol.PORT, 1, InetAddress.getByName("0.0.0.0"));
-            server.setReuseAddress(true);
+            ServerSocket bound = new ServerSocket();
+            bound.setReuseAddress(true);
+            bound.bind(new java.net.InetSocketAddress(InetAddress.getByName("0.0.0.0"), Protocol.PORT), 1);
+            server = bound;
+            if (!running) {
+                closeQuietly(bound);
+                return;
+            }
             while (running) {
                 Socket socket;
                 try {
-                    socket = server.accept();
+                    socket = bound.accept();
                 } catch (Exception e) {
                     if (!running) {
                         break;
                     }
                     continue;
                 }
-                closeQuietly(client);
-                client = socket;
-                handleClient(socket);
-                if (client == socket) {
-                    client = null;
+                if (socket.getInetAddress().isLoopbackAddress()) {
+                    // USB / adb forward：串行处理，保持原有语义。
+                    // 注意不要把 client 先赋成 socket：handleClient 内部会先
+                    // closeQuietly(client) 关掉"上一个客户端"，此时若它已经等于
+                    // 本连接，就会把正在服务的 socket 自己关掉（表现为只收到
+                    // HELLO、之后 STATUS 与控制全断）。
+                    handleClient(socket);
+                    if (client == socket) {
+                        client = null;
+                    }
+                    callbacks.onClient(false, "");
+                    continue;
                 }
-                callbacks.onClient(false, "");
+                // 局域网：鉴权最多可能耗掉几秒，放到独立线程去做，
+                // 否则任意一台局域网主机连上来就能把 USB 客户端挡在门外。
+                if (lanClients.incrementAndGet() > MAX_LAN_CLIENTS) {
+                    lanClients.decrementAndGet();
+                    closeQuietly(socket);
+                    continue;
+                }
+                Thread worker = new Thread(() -> {
+                    try {
+                        handleClient(socket);
+                        if (client == socket) {
+                            client = null;
+                        }
+                        callbacks.onClient(false, "");
+                    } finally {
+                        lanClients.decrementAndGet();
+                    }
+                }, "lx04-tcp-lan");
+                worker.setDaemon(true);
+                worker.start();
             }
         } catch (Exception ignored) {
+        } finally {
+            // 绑定失败（端口被占等）时必须复位，否则 running 永远为 true，
+            // 后续 start() 直接 return，桥接再也起不来且没有任何日志。
+            running = false;
         }
     }
 
@@ -182,8 +234,17 @@ final class TcpBridgeServer {
             out.write(Protocol.encode(Protocol.HELLO, (byte) 0, seq.incrementAndGet(),
                     SystemClock.elapsedRealtime(), helloPayload()));
             out.flush();
+            // USB（adb forward）来的客户端地址是回环；局域网客户端必须先通过鉴权，
+            // 通过之后才让它成为"当前客户端"。
+            if (!socket.getInetAddress().isLoopbackAddress()
+                    && !callbacks.authorize(socket, in, out)) {
+                closeQuietly(socket);
+                return;
+            }
+            closeQuietly(client);
+            client = socket;
             callbacks.onClient(true, "");
-            Thread reader = new Thread(() -> readLoop(in), "lx04-tcp-in");
+            Thread reader = new Thread(() -> readLoop(socket, in), "lx04-tcp-in");
             reader.start();
             long lastStatus = 0;
             while (running && client == socket && !socket.isClosed()) {
@@ -219,30 +280,32 @@ final class TcpBridgeServer {
         }
     }
 
-    private void readLoop(InputStream in) {
-        byte[] header = new byte[Protocol.HEADER_SIZE];
+    private void readLoop(Socket socket, InputStream in) {
+        // 用带进度的 Reader：读超时打断在帧中间时不会丢已读字节，避免帧错位。
+        Protocol.Reader reader = new Protocol.Reader(in);
         try {
-            while (running) {
+            while (running && client == socket) {
+                Protocol.Frame frame;
                 try {
-                    if (!readFully(in, header)) {
-                        break;
-                    }
+                    frame = reader.next();
                 } catch (SocketTimeoutException timeout) {
                     enqueue(Protocol.PING, 0, new byte[0]);
                     continue;
                 }
-                Protocol.Frame frame = Protocol.decodeHeader(header);
                 if (frame == null) {
                     break;
                 }
-                byte[] payload = new byte[frame.payloadLength];
-                if (frame.payloadLength > 0 && !readFully(in, payload)) {
-                    break;
-                }
-                frame.payload = payload;
                 dispatch(frame);
             }
         } catch (Exception ignored) {
+        } finally {
+            // 读线程死了必须收尾：以前只退出循环，socket 不关、client 不清，
+            // 音箱侧还以为"已连接"，实际已经收不到任何控制指令。
+            if (client == socket) {
+                closeQuietly(socket);
+                client = null;
+                callbacks.onClient(false, "");
+            }
         }
     }
 
@@ -297,19 +360,17 @@ final class TcpBridgeServer {
         }
     }
 
-    private static boolean readFully(InputStream in, byte[] dest) throws Exception {
-        int off = 0;
-        while (off < dest.length) {
-            int n = in.read(dest, off, dest.length - off);
-            if (n < 0) {
-                return false;
-            }
-            off += n;
+    private static void closeQuietly(Socket socket) {
+        if (socket == null) {
+            return;
         }
-        return true;
+        try {
+            socket.close();
+        } catch (Exception ignored) {
+        }
     }
 
-    private static void closeQuietly(Socket socket) {
+    private static void closeQuietly(ServerSocket socket) {
         if (socket == null) {
             return;
         }

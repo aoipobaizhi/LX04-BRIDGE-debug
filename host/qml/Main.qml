@@ -358,7 +358,7 @@ ApplicationWindow {
                         visible: win.navOpen
                         Label { text: host.connected ? "已连接" : "未连接"; color: win.ink }
                         Label {
-                            text: host.connected ? "LX04 · USB / ADB" : "请连接 LX04"
+                            text: host.connected ? (host.transportIndex > 0 ? "LX04 · WiFi" : "LX04 · USB / ADB") : "请连接 LX04"
                             color: win.muted
                             font.pixelSize: 11
                             wrapMode: Text.NoWrap
@@ -432,7 +432,7 @@ ApplicationWindow {
                                             }
                                         }
                                         Label {
-                                            text: host.connected ? "LX04 · USB / ADB" : (host.headline === "连接失败" ? "无法连接到 LX04。" : "请连接 LX04 设备后开始使用")
+                                            text: host.connected ? (host.transportIndex > 0 ? "LX04 · WiFi" : "LX04 · USB / ADB") : (host.headline === "连接失败" ? "无法连接到 LX04。" : "请连接 LX04 设备后开始使用")
                                             wrapMode: Text.Wrap
                                             color: win.ink
                                             Layout.fillWidth: true
@@ -458,14 +458,18 @@ ApplicationWindow {
                                 GroupCard {
                                     title: "设备"
                                     Label {
-                                        text: host.connected ? (host.hasDevice ? usbBox.displayText : "LX04") : (host.hasDevice ? usbBox.displayText : "未检测到 LX04")
+                                        text: host.transportIndex > 0
+                                              ? (host.connected ? (host.wifiIp || "LX04") : "WiFi · " + (host.wifiIp || "未填写 IP"))
+                                              : (host.connected ? (host.hasDevice ? usbBox.displayText : "LX04") : (host.hasDevice ? usbBox.displayText : "未检测到 LX04"))
                                         font.bold: true
                                         color: win.ink
                                         Layout.fillWidth: true
                                     }
                                     Label {
-                                        text: host.connected ? "ADB 已连接 · USB 数据通道正常" : (host.hasDevice ? "ADB · USB" : "")
-                                        visible: host.connected || host.hasDevice
+                                        text: host.connected
+                                              ? (host.transportIndex === 2 ? "局域网直连 · 不占用数据线" : (host.transportIndex === 1 ? "无线 ADB · 不占用数据线" : "ADB 已连接 · USB 数据通道正常"))
+                                              : (host.transportIndex === 2 ? (host.wifiPaired ? "已配对，可直接连接" : "尚未配对") : (host.transportIndex === 1 ? "无线 ADB · 需要先激活一次" : (host.hasDevice ? "ADB · USB" : "")))
+                                        visible: host.connected || host.hasDevice || host.transportIndex > 0
                                         color: win.muted
                                         wrapMode: Text.Wrap
                                         Layout.fillWidth: true
@@ -473,7 +477,7 @@ ApplicationWindow {
                                     HostCombo {
                                         id: usbBox
                                         objectName: "usbBox"
-                                        visible: !host.connected
+                                        visible: !host.connected && host.transportIndex === 0
                                         hostModel: host.deviceModel
                                         hostIndex: host.deviceIndex
                                         emptyText: "未检测到 LX04"
@@ -481,7 +485,7 @@ ApplicationWindow {
                                     }
                                     RowLayout {
                                         Layout.fillWidth: true
-                                        Button { text: "刷新设备"; onClicked: host.refreshDevices() }
+                                        Button { text: "刷新设备"; visible: host.transportIndex === 0; onClicked: host.refreshDevices() }
                                         Item { Layout.fillWidth: true }
                                         Button {
                                             text: "重试"
@@ -492,7 +496,7 @@ ApplicationWindow {
                                         Button {
                                             text: "连接"
                                             highlighted: true
-                                            visible: !host.connected && host.hasDevice && host.headline !== "连接失败"
+                                            visible: !host.connected && (host.transportIndex > 0 ? host.wifiIp.length > 0 : (host.hasDevice && host.headline !== "连接失败"))
                                             onClicked: host.connectDevice()
                                         }
                                         Button {
@@ -501,6 +505,94 @@ ApplicationWindow {
                                             visible: host.connected
                                             onClicked: host.disconnectDevice()
                                         }
+                                    }
+                                }
+
+                                GroupCard {
+                                    title: "连接方式"
+                                    ComboBox {
+                                        id: transportBox
+                                        Layout.fillWidth: true
+                                        model: host.transportLabels
+                                        currentIndex: host.transportIndex
+                                        enabled: !host.connected
+                                        onActivated: (i) => host.setTransportIndex(i)
+                                    }
+                                    Label {
+                                        visible: host.transportIndex > 0
+                                        text: host.transportIndex === 1
+                                              ? "无线 ADB：靠音箱自己的 adb 服务走 WiFi，功能与数据线完全一样（硬件麦、小爱让麦、系统旋转都能用）。首次需要插一次线点「激活无线 ADB」；音箱重启后要再激活一次。"
+                                              : "直连模式：不走 adb，只连 17890/17891/17892 三条 TCP 口。不需要数据线，但硬件麦直采、小爱让麦、系统旋转会不可用（麦克风退回 App 采集）。"
+                                        color: win.muted
+                                        wrapMode: Text.Wrap
+                                        Layout.fillWidth: true
+                                    }
+                                    RowLayout {
+                                        visible: host.transportIndex > 0
+                                        Layout.fillWidth: true
+                                        TextField {
+                                            id: wifiIpField
+                                            Layout.fillWidth: true
+                                            placeholderText: "音箱 IP，例如 192.168.1.23"
+                                            text: host.wifiIp
+                                            enabled: !host.connected
+                                            onEditingFinished: host.setWifiIp(text)
+                                        }
+                                        Button {
+                                            text: host.wifiBusy ? "…" : "扫描"
+                                            visible: host.transportIndex === 2
+                                            enabled: !host.connected && !host.wifiBusy
+                                            onClicked: host.scanWifi()
+                                        }
+                                        Button {
+                                            text: "读出音箱 IP"
+                                            visible: host.transportIndex === 1
+                                            enabled: !host.connected
+                                            onClicked: host.enableWifiAdb()
+                                        }
+                                    }
+                                    ListView {
+                                        visible: host.transportIndex === 2 && host.wifiDevices.length > 0
+                                        Layout.fillWidth: true
+                                        Layout.preferredHeight: Math.min(120, host.wifiDevices.length * 34)
+                                        clip: true
+                                        model: host.wifiDevices
+                                        delegate: ItemDelegate {
+                                            width: ListView.view.width
+                                            text: modelData.label
+                                            onClicked: host.useWifiDevice(modelData.ip)
+                                        }
+                                    }
+                                    RowLayout {
+                                        visible: host.transportIndex === 2
+                                        Layout.fillWidth: true
+                                        TextField {
+                                            id: wifiCodeField
+                                            Layout.fillWidth: true
+                                            placeholderText: "音箱屏幕上显示的 6 位配对码"
+                                            inputMethodHints: Qt.ImhDigitsOnly
+                                            text: host.wifiCode
+                                            enabled: !host.connected
+                                            onEditingFinished: host.setWifiCode(text)
+                                        }
+                                        Button {
+                                            text: "配对"
+                                            highlighted: true
+                                            enabled: !host.connected && !host.wifiBusy
+                                            onClicked: host.pairWifi()
+                                        }
+                                        Button {
+                                            text: "清除配对"
+                                            visible: host.wifiPaired
+                                            onClicked: host.forgetWifi()
+                                        }
+                                    }
+                                    Label {
+                                        visible: host.transportIndex > 0 && host.wifiStatus.length > 0
+                                        text: host.wifiStatus
+                                        color: win.muted
+                                        wrapMode: Text.Wrap
+                                        Layout.fillWidth: true
                                     }
                                 }
 
@@ -990,7 +1082,7 @@ ApplicationWindow {
                                     color: win.muted
                                 }
                                 Label {
-                                    text: "用 USB 把小爱触屏音箱 LX04 接到电脑：麦克风、扬声器和屏幕都可以走这条线。"
+                                    text: "用 USB 把小爱触屏音箱 LX04 接到电脑：麦克风、扬声器和屏幕都可以走这条线。\n没有数据线时，把连接方式切成「WiFi 局域网」：音箱上打开 WiFi 配对模式，电脑扫描到后输入屏幕上的 6 位配对码即可。"
                                     wrapMode: Text.Wrap
                                     color: win.ink
                                     Layout.fillWidth: true

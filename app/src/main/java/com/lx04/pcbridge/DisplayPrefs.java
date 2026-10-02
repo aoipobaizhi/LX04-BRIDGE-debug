@@ -19,6 +19,10 @@ final class DisplayPrefs {
     private static final String KEY_CLOCK_SECOND = "clock_second";
     private static final String KEY_HUD_BG_SLOT = "hud_bg_slot";
     private static final String KEY_HUD_BG_ALPHA = "hud_bg_alpha";
+    private static final String KEY_WIFI_PAIRING = "wifi_pairing";
+    private static final String KEY_WIFI_TOKEN = "wifi_token";
+    private static final String KEY_WIFI_PAIRED_IP = "wifi_paired_ip";
+    private static final String KEY_WIFI_PAIRED_NAME = "wifi_paired_name";
 
     private DisplayPrefs() {
     }
@@ -130,6 +134,48 @@ final class DisplayPrefs {
 
     static void setHudBgAlpha(Context context, int alpha) {
         prefs(context).edit().putInt(KEY_HUD_BG_ALPHA, alpha).apply();
+    }
+
+    static boolean isWifiPairing(Context context) {
+        return prefs(context).getBoolean(KEY_WIFI_PAIRING, false);
+    }
+
+    static void setWifiPairing(Context context, boolean on) {
+        prefs(context).edit().putBoolean(KEY_WIFI_PAIRING, on).apply();
+    }
+
+    /** 配对成功后发给上位机的令牌；非空表示这台音箱已经配过对。 */
+    static String wifiToken(Context context) {
+        return prefs(context).getString(KEY_WIFI_TOKEN, "");
+    }
+
+    static void setWifiToken(Context context, String token) {
+        prefs(context).edit().putString(KEY_WIFI_TOKEN, token == null ? "" : token).apply();
+    }
+
+    static String wifiPairedIp(Context context) {
+        return prefs(context).getString(KEY_WIFI_PAIRED_IP, "");
+    }
+
+    static void setWifiPairedIp(Context context, String ip) {
+        prefs(context).edit().putString(KEY_WIFI_PAIRED_IP, ip == null ? "" : ip).apply();
+    }
+
+    static String wifiPairedName(Context context) {
+        return prefs(context).getString(KEY_WIFI_PAIRED_NAME, "");
+    }
+
+    static void setWifiPairedName(Context context, String name) {
+        prefs(context).edit().putString(KEY_WIFI_PAIRED_NAME, name == null ? "" : name).apply();
+    }
+
+    static void clearWifiPairing(Context context) {
+        prefs(context).edit()
+                .remove(KEY_WIFI_TOKEN)
+                .remove(KEY_WIFI_PAIRED_IP)
+                .remove(KEY_WIFI_PAIRED_NAME)
+                .putBoolean(KEY_WIFI_PAIRING, false)
+                .apply();
     }
 
     static String hudStyleJson(Context context) {
