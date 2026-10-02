@@ -1,177 +1,113 @@
-# LX04 PC Bridge
+# LX04-BRIDGE-debug
 
-把小爱音箱触屏版 **LX04** 变成电脑的麦克风 + 扬声器 + 状态副屏。
+本仓库是 [ndpyzwy-0w0/LX04-BRIDGE](https://github.com/ndpyzwy-0w0/LX04-BRIDGE) 的 fork，分支 `debug`。
 
-音箱里跑一个很小的 APK（无 AndroidX、无 Play 服务），电脑上跑一个 Python 上位机。三条 TCP 通道分别负责**音频/音量/控制**（17890）、**屏幕镜像**（17891）、**系统弹窗**（17892），帧格式见 [protocol.md](protocol.md)。
+> **这个 README 讲的是本 fork 相对上游修了哪些 bug、加了哪些功能。**
+> 上游原版的项目说明（功能、安装、编译、硬件参数等）已原样保留在 **[README-UPSTREAM.md](README-UPSTREAM.md)**；
+> 逐条改动记录见 **[CHANGELOG.md](CHANGELOG.md)**。
 
-## 它做什么
+---
 
-- 音箱采集麦克风，把 PCM 送给电脑；电脑上位机灌进 [VB-CABLE](https://vb-audio.com/Cable/)，其它软件把 `CABLE Output` 选成麦克风
-- 电脑正在播放的声音经 [Hi-Fi Cable](https://vb-audio.com/Cable/) 环回，再送到音箱喇叭
-- 音箱 800×480 屏幕显示：连接状态、右上角日期/时间（日期/时/分/秒可分别开关）、电脑 CPU / GPU 温度与占用、内存、所选磁盘、网速；底部两个按钮分别静音麦克风 / 扬声器
-- 从屏幕右侧向左滑出菜单：「系统设置」（深色/浅色、静音按钮自动隐藏、时间项、开机自启、后台运行、WiFi 配对）、「监视页背景」（默认纯色或最多 3 张上位机上传的图，元素不透明度）、「屏幕镜像 / 状态监视」
-- 样式双向同步：栏目的大字/多条小字、标题、颜色、字号，电脑上改或音箱上长按栏目改，两边实时一致
-- 「系统旋转」锁定整机正向或倒转（音箱没有陀螺仪不会自动转）；「吊装倒转」只转桥接 HUD；「后台运行」把屏幕还给小爱、音频仍走后台
-- 「同步系统弹窗」打开后，Windows 原生通知的标题/正文/按钮显示在音箱上（不是截图），点按钮等于点电脑上的通知
-- 「屏幕镜像」把电脑画面投到音箱，可选投哪块显示器与码率（流畅 / 清晰 / 高清 / 最高）
+## 一、新增功能
 
-> 官方固件的 Micro USB **默认不能装第三方 APK**。要用本项目，音箱需要已经能装普通 APK（社区官改 / X04G / Lineage 等），并使用**能传数据的 Micro USB 线**。
+### 1. WiFi · 无线 ADB（推荐）
 
-## 目录
+**解决什么问题**：原来必须插着 Micro USB 数据线才能用，音箱一动就得拔插。
 
-| 路径 | 说明 |
-|------|------|
-| `app/` | LX04 上的 APK（Android 8.1+，`minSdk 26`） |
-| `host/` | Windows 上位机（Python + PySide6/QML） |
-| `host/一键启动上位机.bat` | 上位机开发版一键启动（优先用已装好依赖的 venv） |
-| `host/install_apk.bat` | 装 APK + 授权 + 拉起后台服务 |
-| `protocol.md` | 帧格式、UDP 配对、鉴权说明 |
-| `CHANGELOG.md` | 改动记录 |
+**原理**：Android 8.1 **没有** Android 11 才有的「无线调试配对」，但 `adb tcpip` 从很早就支持——它把音箱上的 `adbd` 重启到 TCP 模式，之后电脑直接 `adb connect 音箱IP:5555` 就能用同一套 adb 隧道。因为沿用电脑上已有的 adb 密钥，**不需要重新配对**，也不用装 Shizuku。
 
-## 三种连接方式
+**怎么用**：
 
-| 方式 | 怎么连 | 能力 |
-|------|--------|------|
-| **USB 数据线** | 插线 → 上位机点「连接」（自动 `adb forward`） | 全部功能 |
-| **WiFi · 无线 ADB** | 插线时点一次「读出音箱 IP」（自动执行 `adb tcpip 5555`）→ 拔线 → 点「连接」 | **与数据线完全一致**：硬件麦直采、小爱让麦、系统旋转全部可用 |
-| **WiFi · 直连** | 音箱「系统设置 → WiFi 配对」打开配对模式（屏幕显示 IP + 6 位配对码）→ 上位机扫描 → 输入配对码 → 配对 → 连接 | 不用 adb、不用装 Shizuku；硬件麦直采 / 小爱让麦不可用（麦克风走 App 采集）。系统旋转需要音箱已授权 `WRITE_SETTINGS`（见下） |
+1. 数据线插着音箱（这一次必须插）
+2. 上位机「连接方式」选 **WiFi · 无线 ADB**
+3. 点 **「读出音箱 IP」** —— 它会自动执行 `adb tcpip 5555`，并把音箱的局域网 IP 填好
+4. **拔掉数据线**，点「连接」
 
-要点：
+**能力**：与数据线**完全一致** —— 硬件麦 `tinycap` 直采、`stop mivpm` 小爱让麦、系统旋转、后台切换都能用。
 
-- Android 8.1 **没有** Android 11 的「无线调试配对」，所以无线 ADB 走的是老式 `adb tcpip` + `adb connect`，沿用电脑上已有的 adb 密钥，不需要再配对。代价：**音箱重启后 adbd 不再监听 TCP，需要再插一次线点一下「读出音箱 IP」**。
-- 「WiFi · 直连」没有这个限制，任何时候都能连。
-- 配对码只显示在音箱屏幕上、由人输入电脑，不随广播外发；配对成功得到的 token 存在两边，之后重连不再要配对码。
-- 电脑点「清除配对」会同时让音箱忘掉 token（否则它的局域网监听会一直开着）。
-- USB（回环地址）的客户端永远自动放行，不受配对影响。
+**代价**：音箱**重启后** `adbd` 不再监听 TCP，需要再插一次线点一下「读出音箱 IP」。想彻底免插线，只能在已 root 的音箱上设 `persist.adb.tcp.port=5555`。
 
-## 电脑准备
+### 2. WiFi · 直连（配对码模式）
 
-1. Windows 10/11 64 位（可开着安全启动）
-2. 官方 **VB-CABLE** 虚拟声卡（捐赠软件）。上位机只打开 [www.vb-cable.com](https://www.vb-cable.com/) 下载页，不附带安装包。装完后**重启**
-3. 要把电脑音乐/视频接到音箱喇叭，再装官方 **Hi-Fi Cable**（同样来自 VB-Audio，和 VB-CABLE 不是同一根线）。**装完后重启**
-4. 上位机已内置 adb，不需要装 Android SDK 也能连音箱
+**解决什么问题**：手边没有数据线、也不想装 Shizuku 时，仍然能用。
 
-装好后 Windows 声音设置里会出现：
+**原理**：电脑直接连音箱的三条 TCP 口（17890 / 17891 / 17892，音箱端本来就监听 `0.0.0.0`），配对和鉴权是新增的一层：
 
-- **CABLE Input**：给上位机灌麦克风（不要设成电脑扬声器）
-- **CABLE Output**：给微信 / QQ 当麦克风
-- **Hi-Fi Cable Input**：连接后作为系统播放设备，声音进音箱喇叭
+| 步骤 | 说明 |
+|---|---|
+| 发现 | 电脑向 UDP **17893** 广播探测，音箱回一条 `offer`（含型号、IP、端口、是否正在配对）——**不含配对码** |
+| 配对 | 音箱屏幕显示 **6 位配对码**，人工输入电脑；对了一次就发一个 32 位 `token`，此后免码 |
+| 鉴权 | 连上 17890 后**首帧必须**发 `{"cmd":"wifi_auth", token 或配对码}`，否则 6 秒内断开 |
+| 收口 | 17891 / 17892 只接受已授权或已配对的 IP；回环地址（USB / adb forward）永远自动放行 |
 
-觉得好用请向 VB-Audio 捐赠。仓库和程序都不附带这两份安装包，商业分发见 [VB-Audio 授权说明](https://vb-audio.com/Services/licensing.htm)。
+**安全设计**：配对码只显示在音箱屏幕上、不随广播外发；连错 5 次冷却 30 秒；上位机点「清除配对」会同时让音箱忘掉 token（否则它的局域网监听会一直开着）。
 
-## 打开上位机
+**能力**：不用 adb，所以**有降级** —— 硬件麦直采、小爱让麦不可用（麦克风退回 App 的 AudioRecord 采集）；「系统旋转」要求音箱已授权 `WRITE_SETTINGS`（`host\install_apk.bat` 里已经包含这条授权，只需一次、重启不丢）。
 
-**方式 A（推荐，双击即可）**：
+### 3. 上位机界面对应改动
 
-```text
-host\一键启动上位机.bat
-```
+- 新增「**连接方式**」卡片：三选一、IP 输入、扫描局域网设备并列出、配对码输入、配对 / 清除配对、读出音箱 IP
+- 新增 `host\一键启动上位机.bat`：自动使用已装好依赖的 venv，双击即用
+- 「设备」卡片会按当前连接方式显示 USB 序列号或 WiFi 地址
 
-它会优先使用 `<工作区>\.tools\venv` 里已经装好依赖的 Python；找不到才退回系统 Python。
+### 4. 协议新增（详见 protocol.md）
 
-**方式 B（自己装依赖）**：
+- UDP **17893**：发现 / 配对报文
+- CONTROL 新增：`wifi_auth`、`wifi_pair`、`wifi_forget`
+- STATUS 新增：`clientIsLan`、`wifiOn`、`wifiPairing`、`wifiPaired`、`wifiIp`、`wifiPort`、`wifiPairCode`
 
-```text
-host\install_deps.bat
-host\start_host.bat
-```
+---
 
-或手动：`python -m pip install -r host/requirements.txt`（PySide6 / sounddevice / pycaw / comtypes / psutil）。
+## 二、修复的 bug
 
-**方式 C（打包成 EXE，不依赖本机 Python）**：
+### 上位机（Python）
 
-```text
-python build_host_exe.py
-```
+| 现象 | 原因 |
+|---|---|
+| **所有 adb 调用结果都不可信**：设备明明连不上却报成功、状态判断随机出错 | `subprocess` 用 `text=True`，按系统 ANSI（中文 Windows 是 GBK）解码 adb 输出；遇到非 GBK 字节时读取线程抛 `UnicodeDecodeError`，`stdout` 变空、`returncode` 失真。改为 `utf-8 + errors="replace"`（`release_git.py` 同类问题一并修） |
+| 关闭上位机后立刻重开，**新实例静默退出、不显示窗口** | `_release_single_instance()` 全文件从未调用，命名互斥体要等进程真正结束才释放 |
+| 退出后**电脑没声音**（默认播放设备留在 CABLE 上） | `_shutdown_work` 用一个大 `try` 包住整条清理链，`hw.stop()` 一抛异常就跳过了 `_restore_render` |
+| 界面卡住后**电平条不动、音量同步失效、状态栏不再更新**，只能重启 | `_tick` 80ms 心跳只有"重新挂定时器"那句在 `try` 里，中途任何异常都会让心跳永久停摆且无日志 |
+| 长时间挂着内存持续增长 | `QtLoop` 每次 `after()` 新建 `QTimer` 却从不销毁（心跳 12.5 次/秒、音频帧 100 次/秒） |
+| 点「刷新设备」界面**卡死 4 秒多**，点「连接」卡死几十秒 | 设备枚举（COM 端点约 4.9 s）+ `adb devices`（异常时 8 s 超时）+ 三通道握手全部跑在 GUI 线程上。现已全部移入工作线程，结果回主线程填界面；实测刷新 **4318 ms → 0.7 ms**、连接 **约 50000 ms → 1.1 ms**（后台 3.6 s 完成） |
+| `install_apk.bat` 双击报 `'d' / 'ho' / 'exist' 不是内部或外部命令` | 批处理文件用 UTF-8 存了中文，cmd 按 ANSI 代码页解析会把命令行拆碎。改为纯 ASCII + CRLF |
+| `install_apk.bat` 找不到 APK 时仍去安装一个不存在的文件 | `for %%F in ("字面路径")` 对不存在的文件也会赋值，导致两个回退分支永不执行。改用 `if exist` |
+| 装完 APK 后「系统旋转」整机不转 | 缺 `appops set ... WRITE_SETTINGS allow` 授权，脚本里已补上 |
 
-生成 `dist/LX04-PC-Bridge-Host.exe`，之后双击根目录的 `启动上位机.bat` 即可（它会优先启动打包版）。
+### 音箱端（Android）
 
-> 这些 `.bat` 一律是**纯英文 ASCII + CRLF** 保存的：cmd 用系统 ANSI 代码页解析批处理，文件里写中文会在某些系统上被拆成乱码命令（典型报错 `'d' 不是内部或外部命令`）。改这些文件时请保持 ASCII。
+| 现象 | 原因 |
+|---|---|
+| 用户点「拒绝」录音权限后，**授权页反复弹、应用进不去** | `onRequestPermissionsResult` 无条件再次 `requestPermissions`，形成死循环。改为只请求一次；并且**没有录音权限也能启动服务**（播放与 HUD 本来不依赖录音） |
+| 点音箱上的弹窗按钮时界面卡死（ANR 风险） | `TcpToastServer` 在调用线程（UI 线程）里直接 `write + flush` socket；PC 侧不读 17892 时写满缓冲即阻塞。改为队列 + 专用写线程 |
+| 音箱端服务对外**完全连不上，而且没有任何日志** | 三个 TCP 服务器都是先把 `running = true` 再建 socket，`BindException` 被空 `catch` 吞掉后 `start()` 永远直接 return，再也不会重试 |
+| 端口复用没生效，重启服务可能绑不上 | `setReuseAddress(true)` 写在 `new ServerSocket(port, ...)` **之后**，bind 已经完成。改为 `new ServerSocket()` → `setReuseAddress` → `bind` |
+| 音箱显示"已连接"，但静音/样式/音量**所有控制指令都失灵且不自愈** | 读线程死亡后 socket 不关、`client` 不清、`STATE.clientConnected` 仍是 true。现在读线程退出时会关 socket、清状态并回调断开 |
+| 偶发断连且再也连不上 | socket 读超时打断在**帧中间**时已读字节被丢弃，下次从错位处解析，魔数校验失败直接断链。新增带进度的 `Protocol.Reader`，超时只发 PING、不丢字节 |
+| 音频焦点泄漏，其它播放器一直被判定为"被抢占" | `requestAudioFocus` 从不 `abandonAudioFocus` |
 
-启动后：
+---
 
-1. 点「刷新设备」——**界面不会卡**，设备/音频/磁盘列表在后台约 4 秒填好
-2. 选连接方式；USB 或无线 ADB 都应有 LX04 的序列号（无线是 `IP:5555`）
-3. 点「连接」——同样是后台执行，状态栏显示「正在连接…」，几秒后变「已连接 LX04 v141」
-4. 点「音箱试音」，音箱喇叭应能听到「嘀」
-5. 在微信 / QQ / 语音输入里把麦克风选成 **CABLE Output**；彻底退出再打开这些软件，避免缓存旧设备
-6. 电脑里的音乐/视频会从音箱出声（需已装 Hi-Fi Cable 并重启）。断开后系统扬声器会改回原来的设备
+## 三、验证情况
 
-## 装到音箱
+- **编译**：`:app:assembleDebug` 185,747 B、`:app:assembleRelease`（R8 混淆 + 资源压缩）70,416 B，均构建成功
+- **真机 LX04（Android 8.1）**：
+  - 无线 ADB 通道与直连通道各读到合法 HELLO 帧
+  - 配对 / 鉴权 **11/11 通过**：UDP 广播发现、配对码换 token、token 鉴权、错误 token 被拒、完全不鉴权 6.0 s 被断开、配对窗口自动关闭
+  - 清除配对 `wifi_forget` **7/7 通过**：清除后局域网 0.0 s 立即重新上锁，重新配对仍可用
+  - 已授权 `WRITE_SETTINGS`，系统旋转在直连模式下也能生效
+- **模拟环境**：`host\check_wifi_pair.py` 12/12、QML 离屏加载 0 警告、host 全部 `.py` 通过 `py_compile`
 
-1. 音箱打开 **USB 调试**
-2. 数据线连电脑，`设备管理器` 里应能看到 ADB 设备
-3. 运行：
+---
 
-```text
-host\install_apk.bat
-```
+## 四、升级注意
 
-它做的事（等价手动命令）：
+1. **必须重新安装 APK**：旧包没有鉴权闸门，局域网里任意主机都能连上音箱。
+2. 装完跑一次 `host\install_apk.bat`（内含 `RECORD_AUDIO` 与 `WRITE_SETTINGS` 授权）。
+3. 无线 ADB 模式在**音箱重启后**需要插一次线重新激活；直连模式不需要。
+4. 仓库里的 `.bat` 一律是**纯英文 ASCII + CRLF**，修改时请保持，否则 cmd 会把中文解析成乱码命令。
+5. 上位机依赖：用 `host\一键启动上位机.bat`，或先 `pip install -r host/requirements.txt`。
 
-```text
-adb install -r -t app/build/outputs/apk/debug/app-debug.apk
-adb shell pm grant com.lx04.pcbridge android.permission.RECORD_AUDIO
-adb shell appops set com.lx04.pcbridge WRITE_SETTINGS allow
-adb shell am start-foreground-service -n com.lx04.pcbridge/.BridgeService
-```
+## 五、已知未处理
 
-`WRITE_SETTINGS` 这条**只差一次**：授权后系统旋转才能写进系统设置，且**重启不丢**。没授权时「系统旋转」只会转 App 自己的画面，整机不转。
-
-## 编译 APK
-
-用 Android Studio 打开仓库根目录（JDK 17+），**Build > Build APK(s)**；命令行：
-
-```text
-gradlew.bat :app:assembleDebug
-```
-
-产物在 `app/build/outputs/apk/debug/app-debug.apk`。构建脚本会检查 APK 是否超过 **300MB**（正常几 MB）。
-
-本仓库实测：debug 约 181 KB，release（R8 混淆 + 资源压缩）约 69 KB。
-
-## 常见问题
-
-| 现象 | 原因 / 处理 |
-|------|-------------|
-| 双击 bat 报 `'d' / 'ho' / 'exist' 不是内部或外部命令` | 该 bat 被用 UTF-8 存了中文。仓库里的 bat 已改成纯 ASCII；自己改回来时注意 |
-| 双击启动后没反应，或提示已有实例 | 上位机是单实例程序，第二次启动会把已有窗口弹到前台；若刚关闭又立刻启动，稍等 1～2 秒再点 |
-| 无线 ADB 连不上（`adb 没有监听 TCP`） | 音箱重启过。插一次线，点「读出音箱 IP」重新激活，再拔线 |
-| 配对码模式连不上 | 音箱上要先把「WiFi 配对模式」打开（屏幕会显示 IP + 配对码）；确认手机和电脑在同一网段 |
-| 系统旋转只转了 App 画面 | 音箱还没授权 `WRITE_SETTINGS`，跑一次 `host\install_apk.bat` |
-| 上位机提示找不到 VB-CABLE | 装完虚拟声卡要**重启**；上位机「连接诊断」里能看到各通道状态 |
-| adb 报 `cannot open ...\adb.log: Permission denied` | 少见，一般是 adb server 被异常终止后 `%TEMP%` 不可写。把环境变量 `TEMP`/`TMP` 指到可写目录后执行 `adb start-server` |
-| 音箱录到静音 | 原版小爱占着麦克风。改版 ROM / 关掉语音助手后最稳；上位机「麦克风」关掉即可不用麦克风 |
-
-## 电脑状态怎么来的
-
-上位机每秒采一次，经连接通道推到音箱。
-
-| 项目 | 来源 | 分发时要不要额外东西 |
-|------|------|----------------------|
-| CPU / 内存占用、磁盘容量、网速、开机时长 | 打进 EXE 的 `psutil`，没有则退回 Windows API | 不用 |
-| 磁盘 IO、部分 ACPI 温度、核显占用 | 系统自带 PDH | 不用 |
-| NVIDIA 占用 / 温度 / 功耗 / 风扇 | 本机显卡驱动的 `nvml.dll` | 有驱动即可 |
-| AMD 占用 / 温度 | 本机显卡驱动的 `atiadlxx.dll` | 有驱动即可 |
-| CPU 封装温度 | 本机若开着 MSI Afterburner 就读它的共享内存 | **可选**，读不到就不显示（不会发假的 27°C） |
-
-不要把 Afterburner、HWiNFO、LibreHardwareMonitor 打进安装包。
-
-## 硬件与系统
-
-| 项目 | LX04 |
-|------|------|
-| 芯片 | MT8167，约 1GB 内存 |
-| 屏幕 | 3.97 寸，800×480，横屏 |
-| 麦克风 | 顶部双麦 |
-| 接口 | Micro USB（刷机/开调试后可走数据） |
-| 系统 | 原版偏 Android 8.1；国际版 X04G 为 Android 10。本 APK `minSdk 26`，两种都能装 |
-
-## 体积约束
-
-- APK 硬限制：≤ 300MB（Gradle 超限会失败）
-- 实际：不引入大型依赖，release + minify 预期 **&lt; 5MB**
-
-## 许可
-
-原创源码以 [Apache License 2.0](LICENSE) 发布。第三方仍走各自协议，见 [NOTICE](NOTICE)。VB-CABLE / Hi-Fi Cable 是 VB-Audio 的捐赠软件，不在 Apache 范围内。
+代码审查里还发现了一些问题（多为性能/健壮性，不影响本次功能），清单见 [CHANGELOG.md](CHANGELOG.md) 的「已知未处理」一节。
