@@ -685,6 +685,10 @@ class HostApp:
         self.autostart = Var(False)
         self.minimize_to_tray = Var(False)
         self.disk_var = Var("")
+        # 监视页磁盘卡片可同时显示最多 4 个盘的占用率；多盘时只出数字、不出折线。
+        self.disk_multi = Var(False)
+        self.extra_disks = Var([])
+        self._disk_letters: list[str] = []
         self.monitor_var = Var("")
         self.quality_var = Var(screen_mirror.DEFAULT_QUALITY)
         self._saved_disk = ""
@@ -826,6 +830,10 @@ class HostApp:
         self.spk_enabled.set(bool(data.get("spk_enabled", False)))
         self.set_default_spk.set(bool(data.get("set_default_spk", True)))
         self.volume_sync.set(bool(data.get("volume_sync", False)))
+        self.disk_multi.set(bool(data.get("disk_multi", False)))
+        extra = data.get("extra_disks")
+        if isinstance(extra, list):
+            self.extra_disks.set([str(x) for x in extra[:3]])
         self.pc_stats_enabled.set(bool(data.get("pc_stats", True)))
         self.upside_down.set(bool(data.get("upside_down", False)))
         self.sys_rotation.set(adb_usb.clamp_rotation(data.get("sys_rotation", 0)))
@@ -865,6 +873,8 @@ class HostApp:
             "spk_enabled": bool(self.spk_enabled.get()),
             "set_default_spk": bool(self.set_default_spk.get()),
             "volume_sync": bool(self.volume_sync.get()),
+            "disk_multi": bool(self.disk_multi.get()),
+            "extra_disks": [str(x) for x in (self.extra_disks.get() or [])],
             "pc_stats": bool(self.pc_stats_enabled.get()),
             "upside_down": bool(self.upside_down.get()),
             "sys_rotation": adb_usb.clamp_rotation(self.sys_rotation.get()),
@@ -1168,11 +1178,13 @@ class HostApp:
         if not chosen:
             system = next((label for item, label in zip(items, labels) if item.get("system")), "")
             chosen = system or (labels[0] if labels else "")
-        return {"labels": labels, "chosen": chosen}
+        letters = [str(item.get("letter") or "").upper()[:2] for item in items]
+        return {"labels": labels, "chosen": chosen, "letters": letters}
 
     def _apply_disks(self, data: dict) -> None:
         data = data or {}
         labels = list(data.get("labels") or [])
+        self._disk_letters = [str(x) for x in (data.get("letters") or []) if x]
         self.disk_drop.set_labels(labels)
         if data.get("chosen"):
             self.disk_var.set(str(data["chosen"]))
@@ -1436,6 +1448,20 @@ class HostApp:
                 return
             snap = pc_stats.snapshot(disk or "C:")
             payload = {key: value for key, value in snap.items() if value is not None and value != ""}
+            if self.disk_multi.get() or self._disk_card_in_style():
+                primary = (self.disk_var.get() or disk or "C:")
+                slots = [primary] + [x for x in (self.extra_disks.get() or []) if x]
+                if len(slots) < 4:
+                    # 没手动选满就用其它固定盘补齐：音箱上把卡片改成"多盘"后立刻就有数据
+                    for letter in (getattr(self, "_disk_letters", None) or []):
+                        if len(slots) >= 4:
+                            break
+                        if all(str(x).upper()[:2] != letter for x in slots):
+                            slots.append(letter)
+                rows = pc_stats.drive_rows(slots)
+                if rows:
+                    # 数组形式：[[盘符, 占用%], ...]，最多 4 组
+                    payload["disks"] = rows
             self._last_stats = payload
             self.client.send_control("pc_stats", **payload)
             line = pc_stats.format_line(snap)
@@ -2735,6 +2761,20 @@ class HostApp:
             self.detail.configure(text="点「连接」重新连接。")
         self._draw_meter("mic", 0)
         self._draw_meter("spk", 0)
+
+    def _disk_card_in_style(self) -> bool:
+        """样式里有没有卡片选了大字"多盘"（含在音箱上长按改的）。"""
+        try:
+            state = hud_preview.live_state(bool(self.light_theme.get()))
+        except Exception:
+            return False
+        cards = state.get("cards") if isinstance(state, dict) else None
+        if not isinstance(cards, list):
+            return False
+        for card in cards:
+            if isinstance(card, dict) and str(card.get("metric") or "") == "disks":
+                return True
+        return False
 
     def _apply_mute_headline(self, mic_muted: bool, spk_muted: bool) -> None:
         if mic_muted and spk_muted:
