@@ -1124,6 +1124,7 @@ ApplicationWindow {
                                     textFormat: Text.RichText
                                     text: "Copyright © 2026 LX04 PC Bridge<br/>" +
                                           "作者 <a href=\"https://github.com/ndpyzwy-0w0\">ndpyzwy-0w0</a><br/>" +
+                                          "本 fork 分支来自 <a href=\"https://github.com/aoipobaizhi\">aoipobaizhi</a><br/>" +
                                           "原创源码 <a href=\"https://www.apache.org/licenses/LICENSE-2.0\">Apache License 2.0</a>。<br/><br/>" +
                                           "本软件使用：Python、" +
                                           "<a href=\"https://www.qt.io/\">Qt / PySide6</a>（The Qt Company，FluentWinUI3）、" +
@@ -1132,7 +1133,8 @@ ApplicationWindow {
                                           "<a href=\"https://www.vb-cable.com/\">VB-CABLE</a> 与 " +
                                           "<a href=\"https://vb-audio.com/Cable/\">Hi-Fi Cable</a> 是 VB-Audio（Vincent Burel）的捐赠软件；" +
                                           "<a href=\"https://www.msi.com/Landing/afterburner\">MSI Afterburner</a> 是 MSI 的专有软件。" +
-                                          "本程序不附带安装包，只打开官网下载页；已安装 Afterburner 时则启动本机程序。"
+                                          "本程序不附带安装包，只打开官网下载页；已安装 Afterburner 时则启动本机程序。<br/><br/>" +
+                                          "本 fork 的改动：WiFi 配对 / 无线 ADB / 磁盘多盘卡片等。"
                                     onLinkActivated: (link) => Qt.openUrlExternally(link)
                                 }
                             }
