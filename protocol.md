@@ -147,6 +147,7 @@ USB 模式下不需要配对；`WifiPairServer` 在音箱菜单里「WiFi 配对
 {"cmd": "wifi_auth", "token": "…", "name": "PC-NAME"}
 {"cmd": "wifi_pair", "on": true}
 {"cmd": "wifi_forget"}
+{"cmd": "link", "via": "wifiadb"}
 {"cmd": "pc_stats", "cpu": 34, "cpuT": 59, "gpu": 12, "gpuT": 49, "gpuN": "RTX 4070 SUPER", "vram": 28, "gpuW": 32, "ram": 35, "ramU": 22.2, "ramT": 63.8, "disk": 42, "diskN": "D:", "diskU": 400, "diskT": 931, "netD": 1500, "netU": 120, "up": 3600, "cores": 24, "now": 1710000000000, "tz": 480}
 {"cmd": "mirror_info", "title": "1  1920×1080  主屏"}
 {"cmd": "toast_overlay", "on": true, "app": "Cursor", "title": "申请权限", "body": "想要使用麦克风", "buttons": [{"id": "0", "label": "拒绝"}, {"id": "1", "label": "允许"}]}
@@ -159,7 +160,7 @@ USB 模式下不需要配对；`WifiPairServer` 在音箱菜单里「WiFi 配对
 
 `mute` / `unmute` / `toggle_mute` 只切麦克风。扬声器用 `mute_spk` / `unmute_spk` / `toggle_spk_mute`。STATUS 里 `micMuted` / `spkMuted` 分开报；`muted` 仍表示麦克风静音（兼容旧上位机）。`upside_down` 由上位机切换吊装倒转（只转桥接 HUD）。`sys_rotation` 锁定整机 Android 界面正向或倒转：`rot` 为 `0`（0°）或 `2`（180°）。音箱没有陀螺仪，不会自动转；上位机写入 `Settings.System.USER_ROTATION` 并关掉加速度计旋转，APK 再 `setRequestedOrientation` 跟上。STATUS `sysRotation` 回传当前值。`hide_ui` 为 true 时关掉桥接 Activity，服务继续跑，屏幕还给小爱原界面；false 再拉起监视屏。STATUS `uiHidden` 与上位机「后台运行」同步；音箱系统设置里也可切「显示 / 后台」。点桌面图标或通知会重新打开监视屏。`light_theme` 切换浅色/深色底；音箱从右侧滑出菜单进入「系统设置」也可改，两边通过 STATUS `lightTheme` 与 CONTROL `light_theme` 实时同步。`hud_style` 同步各板块标题、大字颜色、大字号（`valueSize`，默认 28）和小字号（`subSize`，默认 11），以及大字（`metric`）和小字。小字默认一条（`subMetric`）；也可发 `subMetrics` 数组，每个板块最多 4 条，从上往下排。可选数据：cpu / cpuT / gpu / gpuT / gpuW / gpuFan / vram / ram / ramGB / disk / diskGB / diskIo / netD / netU / cores / gpuN；小字还可 `none` 不显示。每个板块可开 `valueShift`：大字按占用从 `valueColor`（默认 `#3DDC97`）线性过渡到 `valueColorTo`（默认 `#FF5C7A`）；关闭则大字固定为 `valueColor`。每个板块下半空位可画折线：`chart` 默认开启，`chart: false` 关闭；`chartMetric` 选折线数据，省略则跟随大字。字号超出板块宽高时会自动缩小并裁切，不会画出格子。`rev` 为双方的样式版本，较大的覆盖较小的。音箱长按某一栏目可编辑，改动经 STATUS `hudStyle` 回传电脑；电脑预览的改动经 CONTROL 下发。两边实时同一套样式。音箱显示真实读数，预览只用示意数字。`reset: true` 恢复默认。未连接上位机时，音箱等待页有「重置样式」。
 
-`FILE` 把一张 800×480 JPEG 写进音箱监视页背景库（最多 3 张）。`flags` 是槽位 0–2；库满时上位机让用户选替换哪一张。音箱系统设置里可选「默认」或已存背景，长按删除；「元素不透明度」`alpha` 为 20–100（STATUS `hudBg.alpha`，CONTROL `hud_opacity`），只作用于卡片/按钮，背景图保持清晰。`hud_bg` 的 `select`（`slot` -1 为默认纯色）和 `delete` 也可由电脑下发。
+`link` 由上位机在会话建立/重连时下发，`via` 为 `usb` / `wifiadb` / `wifi`；音箱端据此显示链路（避免无线 ADB 时显示成「USB 未连接」）。`FILE` 把一张 800×480 JPEG 写进音箱监视页背景库（最多 3 张）。`flags` 是槽位 0–2；库满时上位机让用户选替换哪一张。音箱系统设置里可选「默认」或已存背景，长按删除；「元素不透明度」`alpha` 为 20–100（STATUS `hudBg.alpha`，CONTROL `hud_opacity`），只作用于卡片/按钮，背景图保持清晰。`hud_bg` 的 `select`（`slot` -1 为默认纯色）和 `delete` 也可由电脑下发。
 
 `PLAY` 是电脑正在播放的声音，送给音箱喇叭。与 `AUDIO`（音箱麦克风 → 电脑）方向相反。
 

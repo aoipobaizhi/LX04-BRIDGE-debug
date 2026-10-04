@@ -27,6 +27,10 @@ public class MainActivity extends Activity {
     private final Runnable tick = new Runnable() {
         @Override
         public void run() {
+            // 空闲时没必要 20fps 全屏自绘（MT8167 + 1GB 内存上很吃 CPU）：
+            // 镜像/弹窗要流畅 -> 60fps；录音时电平条要跟手 -> 20fps；
+            // 有电脑数据 -> ~8fps（走折线/数字）；完全空闲 -> 4fps（只走时钟）。
+            long delay = 250;
             if (hud != null) {
                 boolean want = BridgeService.STATE.upsideDown;
                 if (want != appliedUpsideDown) {
@@ -40,9 +44,17 @@ public class MainActivity extends Activity {
                 if (light != appliedLightTheme) {
                     applyChromeColors(light);
                 }
-                hud.invalidate();
+                if (BridgeService.STATE.screenMirror || BridgeService.STATE.toastOverlay) {
+                    delay = 16;
+                } else if (BridgeService.STATE.recording) {
+                    delay = 50;
+                } else if (BridgeService.STATE.hasPcStats()) {
+                    delay = 120;
+                }
+                if (hud.isShown()) {
+                    hud.invalidate();
+                }
             }
-            long delay = (BridgeService.STATE.screenMirror || BridgeService.STATE.toastOverlay) ? 16 : 50;
             handler.postDelayed(this, delay);
         }
     };

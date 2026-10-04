@@ -206,7 +206,7 @@ public class StatusHudView extends View {
         pulse = (pulse + 0.08f) % ((float) (Math.PI * 2));
         boolean live = s.clientConnected && (
                 (s.recording && !s.micMuted) || (s.playLevel > 0.02f && !s.spkMuted));
-        int usbColor = !s.usbConnected ? 0xFFFF5C7A : (s.clientConnected ? 0xFF3DDC97 : 0xFFFFB020);
+        int usbColor = s.clientConnected ? 0xFF3DDC97 : (s.usbConnected ? 0xFFFFB020 : 0xFFFF5C7A);
         accent.setColor(usbColor);
         float usbAlpha = live ? 0.65f + 0.35f * (float) Math.abs(Math.sin(pulse)) : 1f;
         accent.setAlpha((int) (usbAlpha * 255));
@@ -405,7 +405,7 @@ public class StatusHudView extends View {
             dim.setColor(scrim << 24);
             canvas.drawRect(0, 0, w, dp(28), dim);
             dim.setColor(colDim);
-            int usbColor = !s.usbConnected ? 0xFFFF5C7A : (s.clientConnected ? 0xFF3DDC97 : 0xFFFFB020);
+            int usbColor = s.clientConnected ? 0xFF3DDC97 : (s.usbConnected ? 0xFFFFB020 : 0xFFFF5C7A);
             accent.setColor(usbColor);
             accent.setAlpha(Math.max(1, Math.min(255, (int) (255 * bar))));
             canvas.drawCircle(dp(16), dp(16), dp(6), accent);
@@ -454,7 +454,7 @@ public class StatusHudView extends View {
         boolean light = s.lightTheme;
         bg.setColor(light ? 0xFFE8ECF2 : 0xFF10131A);
         canvas.drawRect(0, 0, w, h, bg);
-        int usbColor = !s.usbConnected ? 0xFFFF5C7A : (s.clientConnected ? 0xFF3DDC97 : 0xFFFFB020);
+        int usbColor = s.clientConnected ? 0xFF3DDC97 : (s.usbConnected ? 0xFFFFB020 : 0xFFFF5C7A);
         accent.setColor(usbColor);
         canvas.drawCircle(dp(16), dp(16), dp(6), accent);
         String barTitle = "系统弹窗";

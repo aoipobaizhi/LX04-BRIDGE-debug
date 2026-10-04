@@ -102,17 +102,30 @@ final class ScreenMirror {
         }
     }
 
+    /** 没有新帧这么久就退出解码线程：不再常驻一个线程 + 解码器实例，
+     *  accept() 收到新帧会自动 startDecoder() 重新拉起。 */
+    private static final long DECODER_IDLE_MS = 15_000L;
+
     private void decodeLoop() {
         while (running) {
             byte[] jpeg;
             int myEpoch;
             synchronized (inLock) {
+                long idleUntil = android.os.SystemClock.elapsedRealtime() + DECODER_IDLE_MS;
                 while (running && pending == null) {
+                    long left = idleUntil - android.os.SystemClock.elapsedRealtime();
+                    if (left <= 0) {
+                        running = false;
+                        return;
+                    }
                     try {
-                        inLock.wait();
+                        inLock.wait(left);
                     } catch (InterruptedException e) {
                         return;
                     }
+                }
+                if (pending == null) {
+                    continue;
                 }
                 jpeg = pending;
                 pending = null;

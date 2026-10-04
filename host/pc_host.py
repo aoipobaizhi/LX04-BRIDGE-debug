@@ -515,21 +515,56 @@ class BridgeClient:
             try:
                 sock.sendall(data)
             except OSError:
-                self.alive = False
+                # 这里不能把 alive 置 False：失败的可能已经是上一代的 socket，
+                # 置 False 会顺手把刚建好的新连接一起判死（表现为"连上就断"）。
+                # 真的断了，读循环会自己发现并走 disconnected 流程。
+                pass
+
+    # 读到超时不一定代表掉线：音箱空闲时本来就不发帧，而 PING 以前只在
+    # "读到一帧之后"才发，所以空闲 8 秒必掉线。改成超时就发 PING（音箱会回 PONG），
+    # 连续多次都没有任何回包才判定掉线。
+    IDLE_READ_TIMEOUT = 2.0
+    MAX_IDLE_TIMEOUTS = 15          # 2s × 15 = 30 秒毫无响应才判掉线
 
     def _loop(self, gen: int) -> None:
         sock = self.sock
         if sock is None:
             return
         last_ping = time.monotonic()
+        idle = 0
+        try:
+            sock.settimeout(self.IDLE_READ_TIMEOUT)
+        except OSError:
+            pass
         try:
             while self.alive and sock is self.sock:
-                header = _read_exact(sock, protocol.HEADER.size)
+                header = _read_exact_idle(sock, protocol.HEADER.size)
+                if header is None:
+                    idle += 1
+                    if idle > self.MAX_IDLE_TIMEOUTS:
+                        raise ConnectionError("音箱超过 30 秒无响应")
+                    now = time.monotonic()
+                    if now - last_ping > 2:
+                        last_ping = now
+                        self._send(protocol.encode(protocol.PING, seq=self._next_seq()))
+                    continue
+                idle = 0
                 decoded = protocol.try_decode_header(header)
                 if decoded is None:
                     raise ConnectionError("bad frame")
                 msg_type, flags, seq, timestamp_ms, length = decoded
-                payload = _read_exact(sock, length) if length else b""
+                payload = b""
+                if length:
+                    buf = bytearray()
+                    while len(buf) < length:
+                        piece = _read_exact_idle(sock, length - len(buf))
+                        if piece is None:
+                            idle += 1
+                            if idle > self.MAX_IDLE_TIMEOUTS:
+                                raise ConnectionError("帧未收完且音箱无响应")
+                            continue
+                        buf.extend(piece)
+                    payload = bytes(buf)
                 frame = protocol.Frame(msg_type, flags, seq, timestamp_ms, payload)
                 self._handle(frame)
                 now = time.monotonic()
@@ -540,8 +575,10 @@ class BridgeClient:
             if self.alive and gen == self.generation:
                 self.on_event("error", str(exc))
         finally:
-            self.alive = False
+            # 只有"当前这一代"才有资格宣告断开：旧连接线程的 finally 以前会把
+            # 全局 alive 置 False，把刚建立的新连接一起打死（连上就断的元凶）。
             if gen == self.generation:
+                self.alive = False
                 self.on_event("disconnected", "")
 
     def _handle(self, frame: protocol.Frame) -> None:
@@ -572,6 +609,26 @@ def _read_exact(sock: socket.socket, size: int) -> bytes:
     chunks = bytearray()
     while len(chunks) < size:
         piece = sock.recv(size - len(chunks))
+        if not piece:
+            raise ConnectionError("USB 连接已断开")
+        chunks.extend(piece)
+    return bytes(chunks)
+
+
+def _read_exact_idle(sock: socket.socket, size: int) -> bytes | None:
+    """像 _read_exact，但读超时不丢已经读到的字节。
+
+    一个字节都没读到就返回 None（调用方决定发心跳还是判掉线）；
+    读到一半超时会继续等，避免半包被丢掉导致后面帧错位。
+    """
+    chunks = bytearray()
+    while len(chunks) < size:
+        try:
+            piece = sock.recv(size - len(chunks))
+        except socket.timeout:
+            if not chunks:
+                return None
+            continue
         if not piece:
             raise ConnectionError("USB 连接已断开")
         chunks.extend(piece)
@@ -668,6 +725,7 @@ class HostApp:
         self._vol_ignore_pc_until = 0.0
         self._vol_ignore_spk_until = 0.0
         self._stats_ticks = 0
+        self._vol_ticks = 0
         self._stats_logged = False
         self._stats_busy = False
         self._refreshing = False
@@ -1856,6 +1914,7 @@ class HostApp:
             if current and current[0] != device_id and self._prev_render is None:
                 self._prev_render = current
             if win_endpoint.set_default_render(device_id):
+                win_volume.invalidate()
                 self._log("已把系统播放切到: " + name)
             else:
                 self._log("未能把系统播放切到选中的设备。")
@@ -1877,8 +1936,10 @@ class HostApp:
         self._prev_render = None
         self.play_peak = 0.0
         if prev:
-            if win_endpoint.set_default_render(prev[0]) and log:
-                self._log("已恢复系统播放设备: " + prev[1])
+            if win_endpoint.set_default_render(prev[0]):
+                win_volume.invalidate()
+                if log:
+                    self._log("已恢复系统播放设备: " + prev[1])
 
     def _pcm_peak(self, pcm: bytes) -> float:
         peak = 0
@@ -2119,17 +2180,22 @@ class HostApp:
             self._log("麦克风通路已关闭。")
         self._on_gain()
         self.client.send_control("gain", gain=round(self.sink.gain, 3))
-        if self.volume_sync.get():
-            self._push_pc_volume(force=True)
         self._spawn_stats(force=True)
         self._push_upside_down()
         self._push_sys_rotation()
         self._push_ui_hidden()
         self._begin_hud_reconcile()
+        # 告诉音箱这次走的是什么链路：无线 ADB 时数据线是拔掉的，
+        # 音箱只看 USB 就会显示"USB 未连接"。
+        self.client.send_control("link", via=self.transport.get())
         if self.spk_enabled.get():
             self._apply_speaker_route()
         else:
             self._log("扬声器通路已关闭。可用「音箱试音」检查喇叭。")
+        # 必须放在切换默认播放设备之后：win_volume 拿到的是"当前默认设备"的音量接口，
+        # 先读会缓存到旧设备上（拖任务栏音量音箱没反应、拖到 0 也不静音）。
+        if self.volume_sync.get():
+            self._push_pc_volume(force=True)
         self._sync_toast_mirror()
 
     def _connect_failed(self, exc: Exception, serial: str = "") -> None:
@@ -2624,6 +2690,9 @@ class HostApp:
                 self._apply_mic_route()
             self._on_gain()
             self.client.send_control("gain", gain=round(self.sink.gain, 3))
+            self.client.send_control("link", via=self.transport.get())
+            if self.spk_enabled.get() and not self.loopback.running():
+                self._apply_speaker_route()
             if self.volume_sync.get():
                 self._push_pc_volume(force=True)
             self._spawn_stats(force=True)
@@ -2638,7 +2707,8 @@ class HostApp:
     def _revive_gave_up(self, err: str) -> None:
         self._reviving = False
         self._stop_xiaoai_watch()
-        self._session = False
+        # 注意：不要清 _session。以前清掉之后永远不再自动重连，用户必须手动点连接；
+        # 现在保持会话，30 秒后再来一轮（用户点「断开」才会真正结束）。
         self.connected = False
         self._xiaoai_idle = False
         self.hw.stop(self.adb, self._serial)
@@ -2654,9 +2724,15 @@ class HostApp:
             except Exception:
                 pass
             self._xiaoai_held = False
-        self.headline.configure(text="USB 已断开")
-        self.detail.configure(text="多次拉起失败。请检查 USB，或在音箱上打开一次应用。")
         self._log("无法拉起后台服务: " + err)
+        if self._session and not self._closing:
+            self.headline.configure(text="与音箱断开，等待恢复")
+            self.detail.configure(text="30 秒后自动重试；也可点「连接」立即重试。")
+            self.root.after(30_000, self._begin_revive)
+            self._log("30 秒后自动重试拉起")
+        else:
+            self.headline.configure(text="已断开")
+            self.detail.configure(text="点「连接」重新连接。")
         self._draw_meter("mic", 0)
         self._draw_meter("spk", 0)
 
@@ -2828,6 +2904,7 @@ class HostApp:
         # 整个函数体都要兜底：以前只有"重新挂定时器"那一句在 try 里，
         # 中途任何一次异常都会让 80ms 心跳永久停摆（电平条不动、音量同步失效、
         # 状态栏不再更新），而且没有任何日志。
+        visible = True
         try:
             if self._closing:
                 return
@@ -2837,12 +2914,23 @@ class HostApp:
                     self._log("已切换到正在运行的上位机")
                 except Exception:
                     pass
+            # 托盘/最小化时这些 QML 更新看不见，跳过可以省掉大部分重绘开销。
+            visible = True
+            try:
+                visible = bool(self.root.window.isVisible())
+            except Exception:
+                visible = True
             spk = self.loopback.peak if self.loopback.running() else self.play_peak
-            self._draw_meter("mic", self.sink.peak if self.connected else 0)
-            self._draw_meter("spk", spk if self.connected else 0)
+            if visible:
+                self._draw_meter("mic", self.sink.peak if self.connected else 0)
+                self._draw_meter("spk", spk if self.connected else 0)
             if not self.loopback.running():
                 self.play_peak *= 0.82
-            self._push_pc_volume()
+            # win_volume 修好后单次读取只要 0.04ms（原 56.9ms），240ms 轮询的代价可以忽略。
+            self._vol_ticks += 1
+            if self._vol_ticks >= 3:
+                self._vol_ticks = 0
+                self._push_pc_volume()
             self._stats_ticks += 1
             if self._stats_ticks >= 12:
                 self._stats_ticks = 0
@@ -2859,7 +2947,8 @@ class HostApp:
             if self._tray_hwnd and time.monotonic() - self._tray_ping_at > 3:
                 self._tray_ping_at = time.monotonic()
                 self._tray_ping()
-            self.bridge.sync_screen()
+            if visible:
+                self.bridge.sync_screen()
         except Exception as exc:
             try:
                 self._log("心跳异常（已继续运行）: " + repr(exc))
@@ -2868,7 +2957,7 @@ class HostApp:
         finally:
             if not self._closing:
                 try:
-                    self.root.after(80, self._tick)
+                    self.root.after(80 if visible else 200, self._tick)
                 except Exception:
                     pass
 

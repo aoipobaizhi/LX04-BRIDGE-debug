@@ -77,6 +77,7 @@ public class BridgeService extends Service {
                     STATE.toastOverlay = false;
                     STATE.toastTitle = "";
                     STATE.clientIsLan = false;
+                    STATE.linkVia = "";
                     refreshWifiState();
                 }
                 if (connected) {
@@ -190,6 +191,10 @@ public class BridgeService extends Service {
                     return;
                 } else if ("toast_overlay".equals(cmd)) {
                     applyToastOverlay(json);
+                    return;
+                } else if ("link".equals(cmd)) {
+                    // 上位机告知本次链路，避免无线 ADB 时显示成"USB 未连接"。
+                    STATE.linkVia = json.optString("via", "");
                     return;
                 }
                 refreshHeadline();

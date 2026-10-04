@@ -82,17 +82,27 @@ final class BridgeState {
                 && android.os.SystemClock.elapsedRealtime() - pcStatsAt < 12_000;
     }
 
+    /** 上位机本次用的链路："usb" / "wifiadb" / "wifi"，空表示还没收到。 */
+    volatile String linkVia = "";
+
     String formatLink() {
-        if (clientIsLan) {
+        if (clientIsLan || "wifi".equals(linkVia)) {
             return "WiFi 局域网";
+        }
+        if ("wifiadb".equals(linkVia)) {
+            return "WiFi ADB";
+        }
+        if ("usb".equals(linkVia)) {
+            return usbAdb ? "USB ADB" : "USB 已插入";
+        }
+        // 上位机还没告知链路：已连接但线拔了，只能是无线 ADB。
+        if (clientConnected && !usbConnected) {
+            return "WiFi ADB";
         }
         if (!usbConnected) {
             return "USB 未连接";
         }
-        if (usbAdb) {
-            return "USB ADB";
-        }
-        return "USB 已插入";
+        return usbAdb ? "USB ADB" : "USB 已插入";
     }
 
     String formatAudio() {

@@ -1,6 +1,32 @@
 # 更新日志
 
-## v141（本次未发布改动）
+## 第二轮修复（音量同步 / 自动重连 / 链路显示 / 后台占用）
+
+### 修复
+
+| 现象 | 原因 | 改动 |
+|------|------|------|
+| 连接后拖任务栏主音量，音箱响度不变；拖到 0 音箱照样出声（对照：先把 Hi-Fi Cable Input 设为默认设备再连接就正常） | `win_volume` 把"当前默认播放设备的音量接口"只缓存一次，而连接流程**先读音量、后切默认设备**，缓存永久绑在旧设备上 → 每 80 ms 读到的都是旧设备音量，差值恒为 0，一条 `volume` 指令都不发 | 缓存改为**按设备 id** 失效（`GetSpeakers()._dev.GetId()`）；`set_default_render()` 成功后主动 `win_volume.invalidate()`；首次 `_push_pc_volume(force=True)` 移到 `_apply_speaker_route()` **之后**；轮询 80 ms → ~400 ms |
+| 无线 ADB 连接时，音箱端显示"USB 未连接"（明明已连上） | `usbConnected` 只反映物理 USB；`formatLink()` 见线拔了就返回"USB 未连接"，状态灯也按 `!usbConnected` 判红 | 上位机在会话建立/重连时下发新指令 `link`（`via` = `usb`/`wifiadb`/`wifi`）；音箱端据此显示"USB ADB / WiFi ADB / WiFi 局域网"，未收到时按"已连接但线拔了"兜底；状态灯改为**已连接即绿** |
+| 空闲时会周期性断线，且断开后**再也不自动重连**（必须手动点连接） | ① socket 读超时 8 秒就判掉线，而 PING 只在"读到一帧之后"才发 → 音箱空闲不发帧时必然 8 秒断一次；② `BridgeClient.alive` 是全局标志，旧连接线程的 `finally` 会把新连接一起置死（表现为连上就断）；③ 拉起失败 8 次后 `_revive_gave_up` 把 `_session` 清成 False，之后永远不再重试 | 读超时改 2 秒并在超时时**发 PING 保活**（音箱回 PONG），连续 30 秒毫无回包才判掉线；帧中间超时不再丢已读字节；`_loop` 的 `finally` 只有"当前代次"才有权宣告断开；`_send` 失败不再全局判死；拉起失败改为**每 30 秒自动重试**（保留会话） |
+| **上位机后台 CPU 占用高**（实测平均 11.7%、峰值 100%） | `win_volume` 每次读数都调 `pycaw.AudioUtilities.GetSpeakers()`，它内部每次都 `CreateDevice`（实测 **52 ms**）并新建 COM 枚举器（12 ms）= **56.9 ms/次**；旧代码 80 ms 轮询一次 ≈ **71% 一个核**，我上一轮改成 400 ms 轮询仍有 ~14% | 复用 COM 枚举器；默认设备 id **每 1.5 秒才核对一次**（3.9 ms），没变就直接用缓存（**0.042 ms**）；托盘/最小化时不再刷新看不见的电平条与状态同步；心跳 80 ms → 200 ms |
+| 音箱端后台占用偏高 | 监视页每 50 ms 无条件全屏重绘（约 20 fps）；镜像解码线程一旦启动**永不退出**（`running` 没有任何地方置回 false） | 刷新率自适应：镜像/弹窗 16 ms、录音 50 ms、有电脑数据 120 ms、空闲 250 ms，且视图不可见时不重绘；解码线程空闲 15 秒自动退出，收到新帧自动重启；上位机侧音量 COM 轮询降到 ~400 ms |
+
+### 验证
+
+- **真机（LX04 / Android 8.1，无线 ADB）**
+  - 音箱屏幕实测显示 `WiFi ADB`（左上状态点绿色），不再出现"USB 未连接"
+  - 静默 **15 秒连接仍存活**（`alive=True`）；旧代码 8 秒即断
+  - 用本机两个真实播放设备切换验证：音量接口缓存跟随新设备（`bb0ce2edd}` → `67bc3624a}`），测试后已恢复原设备
+  - 连接顺序断言：`link` < `_apply_speaker_route` < `_push_pc_volume` ✓
+- **回归测试**：模拟静默 11 秒不掉线且收到 3 个 PING；不关闭旧连接直接重连，新连接不被旧线程打死 ✓
+- **上位机 CPU 实测**：
+  - `win_volume.get_state()` **56.9 ms → 0.042 ms/次**（500 次调用 0.021 s，等价旧代码 28.4 s 的工作量）
+  - 整个上位机进程（最小化到后台）：**平均 1.98% CPU、峰值 7.8%**；修复前同口径 offscreen 采样为**平均 11.7%、峰值 100%**
+  - `pc_stats.snapshot()` 稳态 15 ms/次（其中 `psutil.net_io_counters()` 占 10 ms，每秒一次 ≈ 1.5%）——可接受，未改
+- **编译**：APK debug 186,082 B；host 侧 `py_compile` 全部通过
+
+## v141（新增 WiFi 连接方式与卡顿修复）
 
 ### 新增
 
@@ -80,13 +106,12 @@
 
 以下是代码审查中发现、但本次未改动的问题（按影响排序，供后续处理）：
 
-- `HudBackground.put` 持锁做 JPEG 解码 + 落盘，与 `onDraw` 同一把锁 → 上传背景时整帧卡住
-- `BridgeClient.alive` 是全局单标志，旧连接线程的 `finally` 可能把新连接打死并误报断线
+- `HudBackground.put` 持锁做 JPEG 解码 + 落盘，与 `onDraw` 同一把锁 → 上传背景时整帧卡住（本轮只降了重绘频率，锁没动）
 - 镜像 17891 单独断线后不重连（静默黑屏）；`send_file` 超限静默丢弃却打印"已上传"
 - `screen_mirror` 的 AccessLost 无退避（安全桌面下每帧重建 D3D11）；GDI 回退路径不画鼠标指针
 - `toast_mirror` 兜底点击坐标算错（`left + right//2` 应为 `(left + right)//2`）
 - `pc_stats` CPU 温度单位分支写反（ACPI 热区温度取不到）
 - `hw_capture` 的 RIFF 头处理脆弱 + `_alive` 跨代共享（可能持续噪声或静默无声）
-- `win_volume` 端点缓存永不失效（音量同步可能操作错设备）；`win_endpoint.GetMixFormat` 内存泄漏
+- `win_endpoint.GetMixFormat` 内存泄漏
 - `WRITE_SETTINGS` 未授权时静默失败而 STATUS 仍回传已生效
 - 中文字段的 JSON `null` 会被读成字符串 `"null"` 显示在屏幕上
