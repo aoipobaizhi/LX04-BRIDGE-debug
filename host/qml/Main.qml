@@ -883,6 +883,32 @@ ApplicationWindow {
                                     }
                                 }
 
+                                Switch {
+                                    text: "多盘显示（最多 4 个盘，只出数字不出折线）"
+                                    checked: host.diskMulti
+                                    onClicked: host.setDiskMulti(checked)
+                                }
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    visible: host.diskMulti
+                                    Label { text: "另外 3 个盘"; color: win.ink }
+                                    HostCombo {
+                                        hostModel: host.diskSlotModel
+                                        hostIndex: host.diskSlotIndexes[0]
+                                        onActivated: (i) => host.setDiskSlotIndex(0, i)
+                                    }
+                                    HostCombo {
+                                        hostModel: host.diskSlotModel
+                                        hostIndex: host.diskSlotIndexes[1]
+                                        onActivated: (i) => host.setDiskSlotIndex(1, i)
+                                    }
+                                    HostCombo {
+                                        hostModel: host.diskSlotModel
+                                        hostIndex: host.diskSlotIndexes[2]
+                                        onActivated: (i) => host.setDiskSlotIndex(2, i)
+                                    }
+                                }
+
                                 GroupCard {
                                     title: "显示"
                                     RowLayout {

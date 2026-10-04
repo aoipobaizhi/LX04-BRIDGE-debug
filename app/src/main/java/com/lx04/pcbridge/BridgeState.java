@@ -82,6 +82,19 @@ final class BridgeState {
                 && android.os.SystemClock.elapsedRealtime() - pcStatsAt < 12_000;
     }
 
+    /** 多盘卡片的每个盘：IO 与占用率都存着，点卡片切换显示哪个。 */
+    volatile java.util.List<String> diskNames = new java.util.ArrayList<>();
+    volatile float[] diskIo = new float[0];
+    volatile float[] diskUsed = new float[0];
+
+    /** 默认显示 IO（磁盘忙时间），点一下卡片切成占用率。 */
+    volatile boolean diskShowUsed;
+
+    boolean hasDiskRows() {
+        return !diskNames.isEmpty() && diskIo.length == diskNames.size()
+                && diskUsed.length == diskNames.size();
+    }
+
     /** 上位机本次用的链路："usb" / "wifiadb" / "wifi"，空表示还没收到。 */
     volatile String linkVia = "";
 

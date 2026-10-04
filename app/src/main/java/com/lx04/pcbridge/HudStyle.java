@@ -12,7 +12,7 @@ final class HudStyle {
     static final String[] DEFAULT_TITLES = {"CPU", "GPU", "内存", "磁盘"};
     static final String[] PICK_METRICS = {
             "cpu", "cpuT", "gpu", "gpuT", "gpuW", "gpuFan", "vram",
-            "ram", "ramGB", "disk", "diskGB", "diskIo", "netD", "netU", "cores", "gpuN"
+            "ram", "ramGB", "disk", "diskGB", "diskIo", "disks", "netD", "netU", "cores", "gpuN"
     };
     static final String[] CHART_METRICS = {
             "cpu", "cpuT", "gpu", "gpuT", "gpuW", "gpuFan", "vram",
@@ -525,16 +525,22 @@ final class HudStyle {
                 || "gpuW".equals(metric) || "gpuFan".equals(metric) || "vram".equals(metric)
                 || "ram".equals(metric) || "ramGB".equals(metric)
                 || "disk".equals(metric) || "diskGB".equals(metric) || "diskIo".equals(metric)
+                || "disks".equals(metric)
                 || "netD".equals(metric) || "netU".equals(metric)
                 || "cores".equals(metric) || "gpuN".equals(metric) || "none".equals(metric);
     }
 
     static boolean isChartable(String metric) {
         if (metric == null || metric.isEmpty() || "none".equals(metric)
-                || "cores".equals(metric) || "gpuN".equals(metric)) {
+                || "cores".equals(metric) || "gpuN".equals(metric) || isMultiDisk(metric)) {
             return false;
         }
         return isKnown(metric);
+    }
+
+    /** 大字指标选"多盘"时，这张卡片竖排显示多个盘的占用率（不出折线）。 */
+    static boolean isMultiDisk(String metric) {
+        return "disks".equals(metric);
     }
 
     static String metricLabel(String metric) {
@@ -579,6 +585,9 @@ final class HudStyle {
         }
         if ("diskIo".equals(metric)) {
             return "磁盘 IO";
+        }
+        if (isMultiDisk(metric)) {
+            return "多盘";
         }
         if ("netD".equals(metric)) {
             return "下载速度";

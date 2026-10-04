@@ -46,6 +46,7 @@ public class BridgeService extends Service {
         setSysRotation(this, DisplayPrefs.sysRotation(this));
         STATE.screenMirror = DisplayPrefs.isScreenMirror(this);
         STATE.autoHideMute = DisplayPrefs.isAutoHideMute(this);
+        STATE.diskShowUsed = DisplayPrefs.diskShowUsed(this);
         STATE.bootStart = DisplayPrefs.isBootStart(this);
         loadClockPrefs(this);
         DisplayPrefs.loadHudStyle(this, STATE.hudStyle);
@@ -677,6 +678,42 @@ public class BridgeService extends Service {
         STATE.pcRam = (float) json.optDouble("ram", 0);
         STATE.pcRamUsed = (float) json.optDouble("ramU", 0);
         STATE.pcRamTotal = (float) json.optDouble("ramT", 0);
+        if (json.has("disks")) {
+            // [[盘符, IO%, 占用%], ...]（旧格式只有 [盘符, 占用%]），最多 4 组
+            org.json.JSONArray rows = json.optJSONArray("disks");
+            java.util.List<String> names = new java.util.ArrayList<>();
+            java.util.List<Float> ios = new java.util.ArrayList<>();
+            java.util.List<Float> useds = new java.util.ArrayList<>();
+            if (rows != null) {
+                for (int i = 0; i < rows.length() && names.size() < 4; i++) {
+                    org.json.JSONArray pair = rows.optJSONArray(i);
+                    if (pair == null || pair.length() < 2) {
+                        continue;
+                    }
+                    String name = pair.optString(0, "").trim();
+                    if (name.isEmpty()) {
+                        continue;
+                    }
+                    if (pair.length() >= 3) {
+                        ios.add((float) pair.optDouble(1, -1));
+                        useds.add((float) pair.optDouble(2, -1));
+                    } else {
+                        ios.add(-1f);
+                        useds.add((float) pair.optDouble(1, -1));
+                    }
+                    names.add(name);
+                }
+            }
+            float[] ioArr = new float[ios.size()];
+            float[] usedArr = new float[useds.size()];
+            for (int i = 0; i < ioArr.length; i++) {
+                ioArr[i] = ios.get(i);
+                usedArr[i] = useds.get(i);
+            }
+            STATE.diskNames = names;
+            STATE.diskIo = ioArr;
+            STATE.diskUsed = usedArr;
+        }
         STATE.pcDisk = (float) json.optDouble("disk", 0);
         STATE.pcDiskUsed = (float) json.optDouble("diskU", 0);
         STATE.pcDiskTotal = (float) json.optDouble("diskT", 0);

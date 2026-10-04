@@ -377,6 +377,99 @@ def _disk_usage(root: str) -> tuple[float, float, float] | None:
     return 100.0 * used / total, used, total
 
 
+class _DriveIoQuery:
+    r"""\LogicalDisk(X:)\% Disk Time —— 每个盘一条计数器。
+
+    和单盘 diskIo 同源（都是"磁盘忙时间占比"），只是按盘分别取。
+    盘符集合变化时整体重建（PDH 不支持删计数器）。
+    """
+
+    def __init__(self, letters: list[str]) -> None:
+        self.hquery = ctypes.c_void_p()
+        self.handles: dict[str, ctypes.c_void_p] = {}
+        self.letters = list(letters)
+        self._ready = False
+        if pdh.PdhOpenQueryW(None, None, ctypes.byref(self.hquery)) != ERROR_SUCCESS:
+            return
+        for letter in self.letters:
+            handle = ctypes.c_void_p()
+            path = "\\LogicalDisk(" + letter + ")\\% Disk Time"
+            if pdh.PdhAddEnglishCounterW(self.hquery, path, None, ctypes.byref(handle)) == ERROR_SUCCESS:
+                self.handles[letter] = handle
+        self._ready = bool(self.handles)
+        if self._ready:
+            pdh.PdhCollectQueryData(self.hquery)
+
+    def sample(self) -> dict[str, float]:
+        out: dict[str, float] = {}
+        if not self._ready:
+            return out
+        if pdh.PdhCollectQueryData(self.hquery) != ERROR_SUCCESS:
+            return out
+        for letter, handle in self.handles.items():
+            value = _pdh_single(handle)
+            if value is not None:
+                out[letter] = round(min(100.0, max(0.0, float(value))), 1)
+        return out
+
+
+_drive_io_query: _DriveIoQuery | None = None
+
+
+def drive_io(letters: list[str]) -> dict[str, float]:
+    """每个盘的 IO 占用百分比（% Disk Time）。"""
+    global _drive_io_query
+    want: list[str] = []
+    for raw in letters:
+        text = str(raw or "").strip()
+        if len(text) >= 2 and text[1] == ":" and text[0].isalpha():
+            letter = text[:2].upper()
+            if letter not in want:
+                want.append(letter)
+    if not want:
+        return {}
+    if _drive_io_query is None or _drive_io_query.letters != want:
+        _drive_io_query = _DriveIoQuery(want)
+    return _drive_io_query.sample()
+
+
+def drive_rows(drives: list[str]) -> list[list]:
+    """[[盘符, IO%, 占用%], ...]，最多 4 个盘。
+
+    监视页的"多盘"卡片默认显示 IO，点一下切成占用率；两个值都发过去，
+    音箱端就不用再来回问电脑了。取不到的字段用 -1 占位。
+    """
+    names: list[str] = []
+    for raw in drives:
+        name = str(raw or "").strip()
+        if not name:
+            continue
+        if len(name) >= 2 and name[1] == ":" and name[0].isalpha():
+            letter = name[:2].upper()
+        else:
+            letter = name.rstrip("\\/").strip() or name
+        if letter not in names:
+            names.append(letter)
+        if len(names) >= 4:
+            break
+    if not names:
+        return []
+    io = drive_io(names)
+    rows: list[list] = []
+    for name in names:
+        usage = None
+        try:
+            usage = _disk_usage(_drive_root(name))
+        except Exception:
+            usage = None
+        rows.append([
+            name,
+            float(io.get(name, -1.0)),
+            round(float(usage[0]), 1) if usage is not None else -1.0,
+        ])
+    return rows
+
+
 class _Sampler:
     def __init__(self) -> None:
         self._last_net = None

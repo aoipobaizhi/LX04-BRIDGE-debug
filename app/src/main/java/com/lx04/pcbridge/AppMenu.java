@@ -302,6 +302,7 @@ final class AppMenu {
         y = drawSwitchRow(canvas, draw, "配对模式", y, wifiRect, BridgeService.isWifiPairing());
         y = drawSettingHint(canvas, draw, wifiHint(), y);
 
+
         bgRow.set(left, y + dp(8), right, y + dp(54));
         if (draw) {
             card.setColor(colCard());

@@ -575,6 +575,8 @@ class HostBridge(QObject):
     injectIndexChanged = Signal()
     spkIndexChanged = Signal()
     diskIndexChanged = Signal()
+    diskMultiChanged = Signal()
+    diskSlotIndexesChanged = Signal()
     monitorIndexChanged = Signal()
     qualityIndexChanged = Signal()
     transportChanged = Signal()
@@ -626,6 +628,9 @@ class HostBridge(QObject):
         self._inject_index = 0
         self._spk_index = 0
         self._disk_index = 0
+        self._disk_slot_indexes = [0, 0, 0]
+        self._disk_slot_model = QStringListModel(self)
+        self._disk_slot_model.setStringList(["不使用"])
         self._monitor_index = 0
         self._quality_index = 0
         self._rotation_index = 0
@@ -740,6 +745,8 @@ class HostBridge(QObject):
             self._sync_combo(kind)
         if kind == "device":
             self.diagChanged.emit()
+        if kind == "disk":
+            self._refresh_disk_slots(labels)
 
     def _combo(self, kind: str) -> tuple[list[str], str, Signal]:
         host = self.host
@@ -801,6 +808,7 @@ class HostBridge(QObject):
         self.rotationIndexChanged.emit()
         self.uiHiddenChanged.emit()
         self.pcStatsEnabledChanged.emit()
+        self.diskMultiChanged.emit()
         self.toastMirrorChanged.emit()
         self.xiaoaiYieldChanged.emit()
         self.xiaoaiIdleChanged.emit()
@@ -1063,6 +1071,34 @@ class HostBridge(QObject):
     @Property(int, notify=spkIndexChanged)
     def spkIndex(self) -> int:
         return self._spk_index
+
+    @Property(bool, notify=diskMultiChanged)
+    def diskMulti(self) -> bool:
+        return bool(self.host.disk_multi.get()) if self.host else False
+
+    @Property(QObject, constant=True)
+    def diskSlotModel(self):
+        return self._disk_slot_model
+
+    @Property("QVariantList", notify=diskSlotIndexesChanged)
+    def diskSlotIndexes(self):
+        return list(self._disk_slot_indexes)
+
+    def _disk_slot_names(self) -> list:
+        if not self.host:
+            return ["", "", ""]
+        names = [str(x) for x in (self.host.extra_disks.get() or [])]
+        return (names + ["", "", ""])[:3]
+
+    def _refresh_disk_slots(self, labels) -> None:
+        """磁盘列表变化时同步"另外 3 个盘"的下拉（第 0 项 = 不使用）。"""
+        names = [str(x) for x in labels]
+        self._disk_slot_model.setStringList(["不使用"] + names)
+        indexes = []
+        for name in self._disk_slot_names():
+            indexes.append(names.index(name) + 1 if name in names else 0)
+        self._disk_slot_indexes = indexes
+        self.diskSlotIndexesChanged.emit()
 
     @Property(QObject, constant=True)
     def diskModel(self):
@@ -1711,6 +1747,38 @@ class HostBridge(QObject):
     def setPcStatsEnabled(self, on: bool) -> None:
         self.host.pc_stats_enabled.set(bool(on))
         self.host._on_pc_stats_change()
+
+    @Slot(bool)
+    def setDiskMulti(self, on: bool) -> None:
+        if not self.host:
+            return
+        self.host.disk_multi.set(bool(on))
+        self.diskMultiChanged.emit()
+        try:
+            self.host._save_routes()
+        except Exception:
+            pass
+        if self.host.connected:
+            self.host._spawn_stats(force=True)
+
+    @Slot(int, int)
+    def setDiskSlotIndex(self, slot: int, index: int) -> None:
+        if not self.host or not (0 <= slot < 3):
+            return
+        labels = list(self._disk_slot_model.stringList())
+        if not (0 <= index < len(labels)):
+            return
+        names = self._disk_slot_names()
+        names[slot] = labels[index] if index > 0 else ""
+        self.host.extra_disks.set(names)
+        self._disk_slot_indexes[slot] = index
+        self.diskSlotIndexesChanged.emit()
+        try:
+            self.host._save_routes()
+        except Exception:
+            pass
+        if self.host.connected:
+            self.host._spawn_stats(force=True)
 
     @Slot(bool)
     def setToastMirror(self, on: bool) -> None:

@@ -38,6 +38,7 @@ METRICS = (
     ("disk", "磁盘占用", "42%"),
     ("diskGB", "磁盘容量", "400 / 931 GB"),
     ("diskIo", "磁盘 IO", "12%"),
+    ("disks", "多盘（最多 4 个盘）", "C:76 D:90"),
     ("netD", "下载速度", "—"),
     ("netU", "上传速度", "—"),
     ("cores", "CPU 核数", "24 核"),
@@ -50,7 +51,7 @@ NONE_METRIC = "none"
 NONE_LABEL = "不显示"
 CHART_FOLLOW = "main"
 CHART_FOLLOW_LABEL = "跟随大字"
-CHART_METRICS = tuple(key for key, _label, _sample in METRICS if key not in {"cores", "gpuN"})
+CHART_METRICS = tuple(key for key, _label, _sample in METRICS if key not in {"cores", "gpuN", "disks"})
 VALUE_SIZE_DEFAULT = 28
 SUB_SIZE_DEFAULT = 11
 VALUE_SIZE_MIN, VALUE_SIZE_MAX = 12, 56

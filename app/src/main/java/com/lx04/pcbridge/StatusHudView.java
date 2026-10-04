@@ -35,6 +35,7 @@ public class StatusHudView extends View {
     };
     private final android.os.Handler touchHandler = new android.os.Handler(android.os.Looper.getMainLooper());
     private int pressSlot = -1;
+    private int tapSlot = -1;
     private float pressX;
     private float pressY;
     private final Runnable longPress = new Runnable() {
@@ -44,6 +45,7 @@ public class StatusHudView extends View {
                 menu.close();
                 editor.open(pressSlot, cardRects[pressSlot]);
                 pressSlot = -1;
+                tapSlot = -1;
             }
         }
     };
@@ -55,6 +57,7 @@ public class StatusHudView extends View {
     private final Paint dim = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint meterBg = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint meter = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint cell = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint sparkStroke = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint sparkFill = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Path sparkPath = new Path();
@@ -669,11 +672,95 @@ public class StatusHudView extends View {
         drawPlayMeter(canvas, s, w);
     }
 
+    /** 多盘卡片（大字指标选"多盘"）：每个盘一个独立格子、自带底栏进度条；
+     *  默认显示磁盘 IO，短按卡片在 IO 与占用率之间切换。 */
+    private void drawDiskRows(Canvas canvas, float x, float y, float cw, float ch,
+            String title, int slot, HudStyle style) {
+        float padX = dp(10);
+        float innerW = Math.max(dp(24), cw - padX * 2);
+        int tc = style.titleColor(slot);
+        if (tc == 0) {
+            tc = colDim;
+        }
+        dim.setColor(tc);
+        float titleSize = fitText(dim, title, innerW, dp(13), dp(9));
+        dim.setTextSize(titleSize);
+        dim.setColor(tc);
+        float titleBase = y + dp(8) - dim.ascent();
+        canvas.drawText(title, x + padX, titleBase, dim);
+
+        BridgeState st = BridgeService.STATE;
+        boolean showUsed = st.diskShowUsed;
+        dim.setTextSize(dp(10));
+        dim.setColor(colDim);
+        String mode = showUsed ? "占用" : "IO";
+        float modeW = dim.measureText(mode);
+        canvas.drawText(mode, x + cw - padX - modeW, titleBase, dim);
+
+        float listTop = titleBase + dim.descent() + dp(7);
+        float listBottom = y + ch - dp(9);
+        if (!st.hasDiskRows()) {
+            dim.setColor(colDim);
+            float hintSize = fitText(dim, "等待上位机数据", innerW, dp(12), dp(9));
+            dim.setTextSize(hintSize);
+            dim.setColor(colDim);
+            canvas.drawText("等待上位机数据", x + padX, listTop - dim.ascent() + dp(2), dim);
+            return;
+        }
+        int n = Math.min(4, st.diskNames.size());
+        float cellGap = dp(4);
+        float cellH = Math.max(dp(16), (listBottom - listTop - cellGap * (n - 1)) / n);
+        float cellPad = dp(6);
+        float barH = Math.max(dp(2), Math.min(dp(4), cellH * 0.16f));
+        for (int i = 0; i < n; i++) {
+            float top = listTop + (cellH + cellGap) * i;
+            float bottom = top + cellH;
+            // 格子底：用白色薄涂层让它比卡片更亮（不是压黑），文字颜色不受影响
+            cell.setColor(lightTheme ? 0x5CFFFFFF : 0x24FFFFFF);
+            tmpRect.set(x + dp(4), top, x + cw - dp(4), bottom);
+            canvas.drawRoundRect(tmpRect, dp(8), dp(8), cell);
+
+            float value = showUsed ? st.diskUsed[i] : st.diskIo[i];
+            int pct = value < 0 ? 0 : (int) Math.round(Math.min(100f, value));
+            int color = value < 0 ? colDim : style.paintValueColor(slot, pct);
+            float textArea = Math.max(dp(9), cellH - barH - dp(7));
+            float nameSize = Math.min(dp(style.subSize(slot) + 3), textArea * 0.52f);
+            float valSize = Math.min(dp(style.valueSize(slot) * 0.60f), textArea * 0.80f);
+            dim.setColor(colDim);
+            dim.setTextSize(nameSize);
+            text.setColor(color);
+            text.setTextSize(valSize);
+            float above = Math.max(-dim.ascent(), -text.ascent());
+            float below = Math.max(dim.descent(), text.descent());
+            float baseline = top + dp(3) + (textArea - (above + below)) / 2f + above;
+            float left = x + dp(4) + cellPad;
+            float right = x + cw - dp(4) - cellPad;
+            canvas.drawText(st.diskNames.get(i), left, baseline, dim);
+            String label = value < 0 ? "--" : pct + "%";
+            canvas.drawText(label, right - text.measureText(label), baseline, text);
+
+            float barTop = bottom - barH - dp(3);
+            meterBg.setColor(lightTheme ? 0x12000000 : 0x2EFFFFFF);
+            tmpRect.set(left, barTop, right, barTop + barH);
+            canvas.drawRoundRect(tmpRect, barH / 2f, barH / 2f, meterBg);
+            if (value > 0) {
+                meter.setColor(color);
+                tmpRect.set(left, barTop, left + Math.max(barH, (right - left) * pct / 100f), barTop + barH);
+                canvas.drawRoundRect(tmpRect, barH / 2f, barH / 2f, meter);
+            }
+        }
+    }
+
     private void drawStatCard(Canvas canvas, float x, float y, float cw, float ch,
             String title, String value, String foot, float usage, int slot) {
         tmpRect.set(x, y, x + cw, y + ch);
         canvas.drawRoundRect(tmpRect, dp(12), dp(12), cardPaint);
         HudStyle style = BridgeService.STATE.hudStyle;
+        String slotMetric = style.metric(slot);
+        if (HudStyle.isMultiDisk(slotMetric)) {
+            drawDiskRows(canvas, x, y, cw, ch, title, slot, style);
+            return;
+        }
         String[] subs = style.displaySubs(slot);
         float padX = dp(10);
         float innerW = Math.max(dp(24), cw - padX * 2);
@@ -976,6 +1063,7 @@ public class StatusHudView extends View {
                 return true;
             }
             pressSlot = cardIndexAt(x, y);
+            tapSlot = pressSlot;
             pressX = x;
             pressY = y;
             if (pressSlot >= 0) {
@@ -996,6 +1084,7 @@ public class StatusHudView extends View {
             if (pressSlot >= 0 && (Math.abs(x - pressX) > dp(12) || Math.abs(y - pressY) > dp(12))) {
                 touchHandler.removeCallbacks(longPress);
                 pressSlot = -1;
+                tapSlot = -1;
             }
             return true;
         }
@@ -1004,6 +1093,7 @@ public class StatusHudView extends View {
             menu.onCancel();
             touchHandler.removeCallbacks(longPress);
             pressSlot = -1;
+            tapSlot = -1;
             toastPressBtn = -1;
             toastPressOutside = false;
             cancelPointer();
@@ -1039,7 +1129,23 @@ public class StatusHudView extends View {
                 return true;
             }
             if (BridgeService.STATE.screenMirror) {
+                tapSlot = -1;
                 return true;
+            }
+            if (tapSlot >= 0) {
+                int slot = tapSlot;
+                tapSlot = -1;
+                // 磁盘"多盘"卡片：短按切换 磁盘 IO <-> 占用率
+                if (HudStyle.isMultiDisk(BridgeService.STATE.hudStyle.metric(slot))) {
+                    boolean next = !BridgeService.STATE.diskShowUsed;
+                    BridgeService.STATE.diskShowUsed = next;
+                    try {
+                        DisplayPrefs.setDiskShowUsed(getContext(), next);
+                    } catch (Exception ignored) {
+                    }
+                    invalidate();
+                    return true;
+                }
             }
             if (muteRevealTap) {
                 muteRevealTap = false;

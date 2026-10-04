@@ -20,6 +20,7 @@ final class DisplayPrefs {
     private static final String KEY_HUD_BG_SLOT = "hud_bg_slot";
     private static final String KEY_HUD_BG_ALPHA = "hud_bg_alpha";
     private static final String KEY_WIFI_PAIRING = "wifi_pairing";
+    private static final String KEY_DISK_SHOW_USED = "disk_show_used";
     private static final String KEY_WIFI_TOKEN = "wifi_token";
     private static final String KEY_WIFI_PAIRED_IP = "wifi_paired_ip";
     private static final String KEY_WIFI_PAIRED_NAME = "wifi_paired_name";
@@ -184,6 +185,15 @@ final class DisplayPrefs {
 
     static void setHudStyleJson(Context context, String json) {
         prefs(context).edit().putString(KEY_HUD_STYLE, json == null ? "" : json).apply();
+    }
+
+    /** 多盘卡片显示占用率（false = 显示磁盘 IO，默认）。 */
+    static boolean diskShowUsed(Context context) {
+        return prefs(context).getBoolean(KEY_DISK_SHOW_USED, false);
+    }
+
+    static void setDiskShowUsed(Context context, boolean on) {
+        prefs(context).edit().putBoolean(KEY_DISK_SHOW_USED, on).apply();
     }
 
     static void clearHudStyle(Context context) {
